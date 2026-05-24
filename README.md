@@ -86,8 +86,6 @@ accounting for architecture (arm64 vs x86_64) and ephemeral storage above the
 512 MB free tier. Pricing constants are hardcoded in the `LoadPricing` state
 of [`templates/benching.asl.json`](templates/benching.asl.json).
 
-Successes are sorted from cheapest to costlier. That's the ranking.
-
 The number and average size of test objects (`TestFileCount`, `TestFileSize`)
 are CloudFormation parameters of the `benching` stack — override them on stack
 update if you want to play with the harness, but please don't include that in
