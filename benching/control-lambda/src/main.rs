@@ -50,8 +50,12 @@ pub enum ControlError {
     ContentMismatch { file: String, actual: String },
     #[error("unknown or duplicate object in archive: '{0}'")]
     UnknownOrDuplicate(String),
-    #[error("archive missing {count} expected object(s) (sample: {sample:?})")]
-    MissingObjects { count: usize, sample: Vec<String> },
+    #[error("archive missing {count} out of {expected} expected object(s) (sample: {sample:?})")]
+    MissingObjects {
+        count: usize,
+        expected: usize,
+        sample: Vec<String>,
+    },
     #[error("missing env var {0}")]
     EnvVar(&'static str),
     #[error("io error: {0}")]
@@ -217,6 +221,8 @@ async fn validate_archive(
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
 
+    let expected_count = expected.len();
+
     for file in filenames.iter() {
         debug!(%file, "Controlling entry name");
 
@@ -240,6 +246,7 @@ async fn validate_archive(
         );
         return Err(ControlError::MissingObjects {
             count: expected.len(),
+            expected: expected_count,
             sample,
         });
     }

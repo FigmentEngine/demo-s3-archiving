@@ -48,7 +48,7 @@ A Step Function takes a list of contender Lambda ARNs as input and, for each
 one in parallel (up to 10 concurrent):
 
 1. Derives the per-contender archive key from the function name.
-2. Invokes the contender Lambda with `{ "archive_key": "archives/<lang>-<dev_id>.zip" }`, timing the call.
+2. Invokes the contender Lambda with `{ "bucket_name": "...", "files_prefix": "files", "archive_key": "archives/<lang>-<dev_id>.zip" }`, timing the call.
 3. Invokes the internal `control` Lambda, which streams the produced ZIP back
    from S3 and validates it (flat layout, one entry per source object, entry
    name equals SHA256 of decompressed content).
@@ -65,8 +65,14 @@ The execution output is a single JSON document with two lists:
       "architecture": "arm64",
       "memory_mb": 512,
       "ephemeral_storage_mb": 512,
-      "duration_ms": 28412,
-      "gb_second": 14.206
+      "duration_ms": 212631,
+      "gb_second_compute": 106.3155,
+      "gb_second_storage": 0,
+      "compute_rate_usd": 0.0000133334,
+      "storage_rate_usd": 0.0000000309,
+      "compute_price_usd": 0.001417537,
+      "storage_price_usd": 0,
+      "run_price_usd": 0.001417537
     }
   ],
   "failure": [
@@ -75,10 +81,12 @@ The execution output is a single JSON document with two lists:
 }
 ```
 
-Ranking is by `gb_second` ascending — `(duration_ms / 1000) * (memory_mb / 1024)`.
-That mirrors Lambda's compute pricing dimension: the cheapest run wins.
+Ranking is by `run_price_usd` ascending — the real Lambda invocation cost,
+accounting for architecture (arm64 vs x86_64) and ephemeral storage above the
+512 MB free tier. Pricing constants are hardcoded in the `LoadPricing` state
+of [`templates/benching.asl.json`](templates/benching.asl.json).
 
-Successes are sorted from cheapest to costier. That's the ranking.
+Successes are sorted from cheapest to costlier. That's the ranking.
 
 The number and average size of test objects (`TestFileCount`, `TestFileSize`)
 are CloudFormation parameters of the `benching` stack — override them on stack
@@ -178,22 +186,26 @@ one in another language), the contract below is everything you need to know.
 **Event** — your handler is invoked with one JSON object:
 
 ```json
-{ "archive_key": "archives/<lang>-<dev_id>.zip" }
+{
+  "bucket_name": "<project>-<account>-<region>",
+  "files_prefix": "files",
+  "archive_key": "archives/<lang>-<dev_id>.zip"
+}
 ```
 
-Read `archive_key` from the event; do not recompute it.
+Read all three fields from the event. The benching Step Function
+injects the right values for every invocation (see `templates/benching.asl.json`).
 
-**Environment variables** — always set by `templates/contenders.yml`:
-
-| Variable | Meaning |
+| Field | Meaning |
 |---|---|
-| `BUCKET_NAME` | S3 bucket holding both the source objects and your output archive |
-| `FILES_PREFIX` | Key prefix of the source objects, no trailing slash (default `files`) |
+| `bucket_name` | S3 bucket holding both the source objects and your output archive |
+| `files_prefix` | Key prefix of the source objects, no trailing slash (default `files`) |
+| `archive_key` | Destination key your produced ZIP must be uploaded to |
 
 **What your Lambda must do**:
 
-1. List and read every object under `s3://${BUCKET_NAME}/${FILES_PREFIX}/`.
-2. Produce a ZIP archive and upload it to `s3://${BUCKET_NAME}/${archive_key}`.
+1. List and read every object under `s3://${bucket_name}/${files_prefix}/`.
+2. Produce a ZIP archive and upload it to `s3://${bucket_name}/${archive_key}`.
 
 **Archive constraints** — the control Lambda rejects anything else:
 
@@ -217,9 +229,9 @@ Failure modes are surfaced verbatim in the state machine output:
 `templates/contenders.yml`. It grants:
 
 - `s3:GetObject` and `s3:ListBucket` on the source bucket, scoped to the
-  `${FILES_PREFIX}/` prefix.
+  configured files prefix.
 - `s3:PutObject`, `s3:AbortMultipartUpload`, `s3:ListMultipartUploadParts`,
-  `s3:ListBucketMultipartUploads` on `${BUCKET_NAME}/archives/*`.
+  `s3:ListBucketMultipartUploads` on `<bucket>/archives/*`.
 - Standard CloudWatch Logs.
 
 **Resource limits** — yours to set. The reference contender uses

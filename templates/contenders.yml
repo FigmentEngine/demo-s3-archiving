@@ -18,14 +18,6 @@ Parameters:
     Default: files
     Description: Key prefix under which the test objects live in the bucket
 
-# SAM Globals sets default properties for ALL AWS::Serverless::Function resources in this template.
-Globals:
-  Function:
-    Environment:
-      Variables:
-        BUCKET_NAME: !Ref BucketName
-        FILES_PREFIX: !Ref FilesPrefix
-
 Resources:
   LambdaContenderRole:
     Type: AWS::IAM::Role

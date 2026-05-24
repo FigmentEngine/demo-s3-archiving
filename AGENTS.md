@@ -8,24 +8,28 @@ get wrong.
 ## What a contender is
 
 A Lambda that, in a single invocation, reads every object under
-`s3://${BUCKET_NAME}/${FILES_PREFIX}/` and uploads a flat ZIP to
-`s3://${BUCKET_NAME}/${archive_key}`. A Step Function times it and
+`s3://${bucket_name}/${files_prefix}/` and uploads a flat ZIP to
+`s3://${bucket_name}/${archive_key}`. A Step Function times it and
 invokes the internal `control` Lambda to validate the ZIP byte-for-byte.
 
 ## Runtime contract (do not deviate)
 
-**Event payload** — read `archive_key` from the event, do not recompute:
+**Event payload** — read all three fields from the event:
 
 ```json
-{ "archive_key": "archives/<lang>-<dev_id>.zip" }
+{
+  "bucket_name": "<project>-<account>-<region>",
+  "files_prefix": "files",
+  "archive_key": "archives/<lang>-<dev_id>.zip"
+}
 ```
 
-**Env vars** — injected by `templates/contenders.yml` `Globals.Function`
-on every contender automatically (do **not** redeclare them in your
-resource block):
+- `bucket_name` — source + destination bucket
+- `files_prefix` — source key prefix, without trailing slash
+- `archive_key` — destination key the produced ZIP must be written to
 
-- `BUCKET_NAME` — source + destination bucket
-- `FILES_PREFIX` — source key prefix, no trailing slash (default `files`)
+These values are injected by the benching Step Function (see
+`templates/benching.asl.json`, `InvokeContender` state).
 
 **ZIP requirements** — `benching/control-lambda/` rejects anything else:
 
@@ -67,9 +71,8 @@ new to CI (see next section).
    `BEGIN CONTENDERS` / `END CONTENDERS` markers. Copy the
    `RustJeremieRodonFunction` + `RustJeremieRodonFunctionLogGroup` block
    and adapt logical IDs, `FunctionName`, `CodeUri`, `Runtime`,
-   `Handler`, `Architectures`. **Do not** redeclare `BUCKET_NAME` /
-   `FILES_PREFIX` env vars (SAM `Globals` injects them) and **do not**
-   create a new IAM role — reuse `Role: !GetAtt LambdaContenderRole.Arn`.
+   `Handler`, `Architectures`. **Do not** create a new IAM
+   role — reuse `Role: !GetAtt LambdaContenderRole.Arn`.
 
 3. **One line** in `Outputs.ContenderArns`, after the
    `INSERT YOUR CONTENDER ARN HERE` marker:
@@ -146,7 +149,7 @@ copy-paste template. Keep its CFN block as the last entry in
 - `Handler: rust.handler` on a `provided.al2023` Lambda — ignored by
   the runtime, just a convention. Keep it when copying.
 - `IAM` permissions look minimal but cover everything contenders need:
-  `s3:GetObject` + `s3:ListBucket` scoped to `${FILES_PREFIX}/`,
+  `s3:GetObject` + `s3:ListBucket` scoped to the source prefix,
   multipart-upload perms scoped to `archives/*`, CloudWatch Logs.
   Do not add new statements unless your contender genuinely needs them
   (it almost certainly does not).

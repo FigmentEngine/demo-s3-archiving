@@ -15,7 +15,6 @@ aws_lambda_events = { workspace = true }
 tokio = { workspace = true }
 
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 rand = { workspace = true }
 rand_distr = { workspace = true }

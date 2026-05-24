@@ -53,22 +53,6 @@ where
     Ok(fut.await?)
 }
 
-fn get_env(var_name: &str) -> String {
-    match std::env::var(var_name) {
-        Ok(value) => {
-            debug!(var_name, value);
-            value
-        }
-        Err(_) => panic!("Mandatory environment variable `{var_name}` is not set"),
-    }
-}
-fn bucket_name() -> String {
-    get_env("BUCKET_NAME")
-}
-fn files_prefix() -> String {
-    get_env("FILES_PREFIX")
-}
-
 macro_rules! intermitent_tracing {
     ($index:ident, $($tt:tt)+) => {
         if $index as usize % TRACING_INFO_FREQUENCY == 0 {
@@ -81,9 +65,11 @@ macro_rules! intermitent_tracing {
 
 // ---------- Event ----------
 
-#[derive(Debug, Deserialize)]
-struct InputEvent {
-    archive_key: String,
+#[derive(Debug, Deserialize, Clone)]
+struct JobInfo {
+    bucket_name: Arc<str>,
+    files_prefix: Arc<str>,
+    archive_key: Arc<str>,
 }
 
 // ---------- Main logic ----------
@@ -92,20 +78,14 @@ struct InputEvent {
 async fn download_file(
     task_index: usize,
     bucket: String,
-    key_prefix: &str,
-    filename: &str,
+    key: String,
     memory_semaphore: Option<Arc<Semaphore>>,
 ) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>), String> {
     debug!("Downloading file");
 
-    let mut response = s3_exec(
-        s3().get_object()
-            .bucket(bucket)
-            .key(format!("{key_prefix}/{filename}"))
-            .send(),
-    )
-    .await
-    .map_err(e2s)?;
+    let mut response = s3_exec(s3().get_object().bucket(bucket).key(key).send())
+        .await
+        .map_err(e2s)?;
 
     let expected_size = response
         .content_length()
@@ -147,6 +127,7 @@ async fn download_file(
 /// Spawns download jobs
 #[instrument(skip_all)]
 fn spawn_download_job(
+    job_info: JobInfo,
     filenames: Vec<String>,
     zip_queue_tx: mpsc::UnboundedSender<(String, Vec<u8>, Option<OwnedSemaphorePermit>)>,
 ) -> tokio::task::JoinHandle<()> {
@@ -154,8 +135,11 @@ fn spawn_download_job(
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
         let memory_semaphore = Arc::new(Semaphore::new(MAX_DOWNLOADS_MEMORY));
 
-        let bucket_name = bucket_name();
-        let files_prefix: Arc<str> = Arc::from(files_prefix());
+        let JobInfo {
+            bucket_name,
+            files_prefix,
+            ..
+        } = job_info;
 
         for (i, filename) in filenames.into_iter().enumerate() {
             debug!(
@@ -166,20 +150,14 @@ fn spawn_download_job(
             let memory_semaphore = memory_semaphore.clone();
             let tx = zip_queue_tx.clone();
 
-            let bucket_name = bucket_name.clone();
-            let files_prefix = files_prefix.clone();
+            let bucket_name = (*bucket_name).to_owned();
+            let key = format!("{files_prefix}/{filename}");
 
             tokio::spawn(async move {
                 debug!("Download job for {filename} started");
                 let _permit = permit;
-                let (data, memory_permits) = download_file(
-                    i,
-                    bucket_name,
-                    &files_prefix,
-                    &filename,
-                    Some(memory_semaphore),
-                )
-                .await?;
+                let (data, memory_permits) =
+                    download_file(i, bucket_name, key, Some(memory_semaphore)).await?;
 
                 debug!("Download job for {filename} completed");
                 tx.send((filename, data, memory_permits)).map_err(e2s)
@@ -328,19 +306,20 @@ struct MultipartUpload {
 /// # Errors
 ///
 /// Returns an error string if the multipart upload cannot be started
-#[instrument(fields(bucket))]
-async fn start_multipart_upload(key: String) -> Result<MultipartUpload, String> {
-    let bucket = bucket_name();
-    let arc_bucket = Arc::from(bucket.as_str());
-    let arc_key = Arc::from(key.as_str());
+#[instrument]
+async fn start_multipart_upload(job_info: JobInfo) -> Result<MultipartUpload, String> {
+    let JobInfo {
+        bucket_name,
+        archive_key,
+        ..
+    } = job_info;
 
-    tracing::Span::current().record("bucket", &bucket);
     info!("Starting multipart upload");
 
     let response = s3_exec(
         s3().create_multipart_upload()
-            .bucket(bucket)
-            .key(key)
+            .bucket(&*bucket_name)
+            .key(&*archive_key)
             .content_type("application/zip")
             .send(),
     )
@@ -354,8 +333,8 @@ async fn start_multipart_upload(key: String) -> Result<MultipartUpload, String> 
     info!(upload_id, "Multipart upload started");
 
     Ok(MultipartUpload {
-        bucket: arc_bucket,
-        key: arc_key,
+        bucket: bucket_name,
+        key: archive_key,
         upload_id: Arc::from(upload_id),
     })
 }
@@ -447,24 +426,21 @@ async fn complete_multipart_upload(
     Ok(())
 }
 #[instrument(skip(filenames))]
-async fn create_multipart_archive(
-    filenames: Vec<String>,
-    archive_name: String,
-) -> Result<(), String> {
+async fn create_multipart_archive(filenames: Vec<String>, job_info: JobInfo) -> Result<(), String> {
     info!(
         "filenames.len()" = filenames.len(),
         "Creating multipart archive"
     );
 
     // 1. Start multipart upload
-    let multipart_upload = start_multipart_upload(archive_name).await?;
+    let multipart_upload = start_multipart_upload(job_info.clone()).await?;
 
     // 2. Set up communication channels
     let (zip_queue_tx, zip_queue_rx) = mpsc::unbounded_channel();
     let (writer, reader) = SlabRing::new(CHUNK_SIZE_BYTES, BUFFER_CHUNKS_COUNT);
 
     // 3. Spawn all jobs
-    let download_handle = spawn_download_job(filenames, zip_queue_tx);
+    let download_handle = spawn_download_job(job_info, filenames, zip_queue_tx);
     let zip_handle = spawn_zip_job(zip_queue_rx, writer);
     let upload_handle = spawn_upload_jobs(reader, multipart_upload.clone());
 
@@ -509,16 +485,12 @@ async fn create_multipart_archive(
 ///
 /// Returns an error string if any page request fails.
 #[instrument]
-async fn list_files(bucket: String, key_prefix: String) -> Result<Vec<String>, String> {
+async fn list_files(bucket: String, key_prefix: &str) -> Result<Vec<String>, String> {
     info!("Listing files");
 
     // Ensure the prefix passed to S3 ends with `/` so we list only objects
     // under the directory and can cleanly strip it to get the filename.
-    let s3_prefix = if key_prefix.ends_with('/') {
-        key_prefix
-    } else {
-        format!("{key_prefix}/")
-    };
+    let s3_prefix = format!("{key_prefix}/");
 
     let mut paginator = s3()
         .list_objects_v2()
@@ -555,19 +527,24 @@ async fn list_files(bucket: String, key_prefix: String) -> Result<Vec<String>, S
     Ok(filenames)
 }
 
-#[instrument(skip_all, fields(archive_key))]
-async fn handler(event: LambdaEvent<InputEvent>) -> Result<(), LambdaError> {
-    let archive_key = event.payload.archive_key;
-    tracing::Span::current().record("archive_key", &archive_key);
-
+#[instrument(skip_all, fields(job_info = ?event.payload))]
+async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
     info!("Start processing");
 
+    let job_info = event.payload;
+
+    let JobInfo {
+        bucket_name,
+        files_prefix,
+        ..
+    } = &job_info;
+
     // 1. List the files from S3
-    let filenames = list_files(bucket_name(), files_prefix()).await?;
+    let filenames = list_files((**bucket_name).to_owned(), files_prefix).await?;
     info!("Creating archive with {} files", filenames.len());
 
     // 2. Launch archive creation
-    create_multipart_archive(filenames, archive_key).await?;
+    create_multipart_archive(filenames, job_info).await?;
 
     Ok(())
 }

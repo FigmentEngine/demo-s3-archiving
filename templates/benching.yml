@@ -115,7 +115,7 @@ Resources:
       FunctionName: !Sub ${ProjectName}-fill-bucket
       CodeUri: ../benching/fill-bucket
       Runtime: provided.al2023
-      MemorySize: 768
+      MemorySize: 512
       Timeout: 600
       Handler: rust.handler
       Architectures:
@@ -256,6 +256,7 @@ Resources:
         ProjectName: !Ref ProjectName
         ControlFunctionArn: !GetAtt ControlFunction.Arn
         BucketName: !Ref Bucket
+        FilesPrefix: !Ref FilesPrefix
         TestFileCount: !Ref TestFileCount
       Role: !GetAtt BenchingStateMachineRole.Arn
       Logging:

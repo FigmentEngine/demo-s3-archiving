@@ -14,8 +14,23 @@
         "ProcessorConfig": {
           "Mode": "INLINE"
         },
-        "StartAt": "DeriveArchiveKey",
+        "StartAt": "LoadPricing",
         "States": {
+          "LoadPricing": {
+            "Type": "Pass",
+            "Comment": "Lambda pricing constants (eu-west-3, USD). Adjust here if needed. Reference: https://aws.amazon.com/lambda/pricing/",
+            "Assign": {
+              "pricing": {
+                "gb_second_by_arch": {
+                  "arm64": 0.0000133334,
+                  "x86_64": 0.0000166667
+                },
+                "gb_second_storage": 0.0000000358,
+                "ephemeral_storage_free_mb": 512
+              }
+            },
+            "Next": "DeriveArchiveKey"
+          },
           "DeriveArchiveKey": {
             "Type": "Pass",
             "Comment": "Derive the contender's function id from its ARN: '<lang>-<dev_id>', e.g. 'rust-jeremie-rodon'. The Function ARN basename is '${ProjectName}-<function_id>'.",
@@ -53,6 +68,8 @@
             "Arguments": {
               "FunctionName": "{% $arn %}",
               "Payload": {
+                "bucket_name": "${BucketName}",
+                "files_prefix": "${FilesPrefix}",
                 "archive_key": "{% $archive_key %}"
               }
             },
@@ -128,7 +145,13 @@
               "memory_mb": "{% $memory_mb %}",
               "ephemeral_storage_mb": "{% $ephemeral_storage_mb %}",
               "duration_ms": "{% $duration_ms %}",
-              "gb_second": "{% ($duration_ms / 1000) * ($memory_mb / 1024) %}"
+              "gb_second_compute": "{% ($duration_ms / 1000) * ($memory_mb / 1024) %}",
+              "gb_second_storage": "{% ($duration_ms / 1000) * (($ephemeral_storage_mb > $pricing.ephemeral_storage_free_mb ? $ephemeral_storage_mb - $pricing.ephemeral_storage_free_mb : 0) / 1024) %}",
+              "compute_rate_usd": "{% $lookup($pricing.gb_second_by_arch, $architecture) %}",
+              "storage_rate_usd": "{% $pricing.gb_second_storage %}",
+              "compute_price_usd": "{% (($duration_ms / 1000) * ($memory_mb / 1024)) * $lookup($pricing.gb_second_by_arch, $architecture) %}",
+              "storage_price_usd": "{% (($duration_ms / 1000) * (($ephemeral_storage_mb > $pricing.ephemeral_storage_free_mb ? $ephemeral_storage_mb - $pricing.ephemeral_storage_free_mb : 0) / 1024)) * $pricing.gb_second_storage %}",
+              "run_price_usd": "{% (($duration_ms / 1000) * ($memory_mb / 1024)) * $lookup($pricing.gb_second_by_arch, $architecture) + (($duration_ms / 1000) * (($ephemeral_storage_mb > $pricing.ephemeral_storage_free_mb ? $ephemeral_storage_mb - $pricing.ephemeral_storage_free_mb : 0) / 1024)) * $pricing.gb_second_storage %}"
             },
             "Next": "DeleteArchive"
           },
@@ -167,8 +190,8 @@
     "PartitionResults": {
       "Type": "Pass",
       "Output": {
-        "success": "{% ($res := $sort([$states.input[kind='success']], function($a, $b) { $a.gb_second > $b.gb_second }) ~> $map(function($v) { { 'arn': $v.arn, 'runtime': $v.runtime, 'architecture': $v.architecture, 'memory_mb': $v.memory_mb, 'ephemeral_storage_mb': $v.ephemeral_storage_mb, 'duration_ms': $v.duration_ms, 'gb_second': $v.gb_second } }); $boolean($res) ? $res : []) %}",
-        "failure": "{% ($res := [$states.input[kind='failure']] ~> $map(function($v) { { 'arn': $v.arn, 'reason': $v.reason } }); $boolean($res) ? $res : []) %}"
+        "success": "{% ($res := $sort([$states.input[kind='success']], function($a, $b) { $a.run_price_usd > $b.run_price_usd }) ~> $map(function($v) { { 'arn': $v.arn, 'runtime': $v.runtime, 'architecture': $v.architecture, 'memory_mb': $v.memory_mb, 'ephemeral_storage_mb': $v.ephemeral_storage_mb, 'duration_ms': $v.duration_ms, 'gb_second_compute': $v.gb_second_compute, 'gb_second_storage': $v.gb_second_storage, 'compute_rate_usd': $v.compute_rate_usd, 'storage_rate_usd': $v.storage_rate_usd, 'compute_price_usd': $v.compute_price_usd, 'storage_price_usd': $v.storage_price_usd, 'run_price_usd': $v.run_price_usd } }); $boolean($res) ? [$res] : []) %}",
+        "failure": "{% ($res := [$states.input[kind='failure']] ~> $map(function($v) { { 'arn': $v.arn, 'reason': $v.reason } }); $boolean($res) ? [$res] : []) %}"
       },
       "End": true
     }

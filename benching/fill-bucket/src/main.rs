@@ -16,8 +16,11 @@ use aws_lambda_events::cloudformation::{
     CloudFormationCustomResourceRequest, CloudFormationCustomResourceResponse,
     CloudFormationCustomResourceResponseStatus,
 };
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+use aws_sdk_s3::{
+    Error as S3Error,
+    primitives::ByteStream,
+    types::{Delete, ObjectIdentifier},
+};
 use awssdk_instrumentation::lambda::{LambdaError, LambdaEvent};
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
@@ -33,7 +36,7 @@ const SIZE_STDDEV: usize = 1 * 1024 * 1024;
 const MAX_DEVIATION: usize = 3 * SIZE_STDDEV; // +/- 3sigma;
 const MIN_FILE_SIZE: usize = 512 * 1024; // 512KB;
 
-const CONCURRENT_UPLOADS: usize = 64;
+const CONCURRENT_UPLOADS: usize = 20;
 
 // ---------- CFN custom resource event types ----------
 
@@ -254,12 +257,14 @@ async fn upload_one(buf: Vec<u8>, bucket: String, prefix: &str) -> Result<(), La
     let digest = Sha256::digest(&buf);
     let hex = to_hex(&digest);
 
-    s3().put_object()
-        .bucket(bucket)
-        .key(format!("{prefix}/{hex}"))
-        .body(ByteStream::from(buf))
-        .send()
-        .await?;
+    s3_exec(
+        s3().put_object()
+            .bucket(bucket)
+            .key(format!("{prefix}/{hex}"))
+            .body(ByteStream::from(buf))
+            .send(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -284,7 +289,7 @@ async fn empty(props: ResourceProperties) -> Result<(), LambdaError> {
         if let Some(token) = continuation_token.as_ref() {
             req = req.continuation_token(token);
         }
-        let page = req.send().await?;
+        let page = s3_exec(req.send()).await?;
 
         let objects: Vec<ObjectIdentifier> = page
             .contents()
@@ -306,11 +311,13 @@ async fn empty(props: ResourceProperties) -> Result<(), LambdaError> {
                 .build()
                 .expect("objects are set");
 
-            s3().delete_objects()
-                .bucket(bucket_name)
-                .delete(delete)
-                .send()
-                .await?;
+            s3_exec(
+                s3().delete_objects()
+                    .bucket(bucket_name)
+                    .delete(delete)
+                    .send(),
+            )
+            .await?;
 
             total_deleted += batch_len;
             info!(total_deleted, "deleted batch of {batch_len} objects");
@@ -375,6 +382,15 @@ fn to_hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{:02x}", byte);
     }
     s
+}
+
+/// This is to wrap S3 operations and force the Result::Err variant to be an S3Error instead of an SdkError.
+/// This is because SdkError, when stringified, are utter useless shit.
+async fn s3_exec<T, E>(fut: impl Future<Output = Result<T, E>>) -> Result<T, S3Error>
+where
+    S3Error: From<E>,
+{
+    Ok(fut.await?)
 }
 
 // This macro from `awssdk-instrumentation` generates the entire main() function:
