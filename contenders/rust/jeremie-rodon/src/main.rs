@@ -6,7 +6,6 @@ mod zipper;
 use std::{io::Write, sync::Arc};
 
 use aws_sdk_s3::{
-    Error as S3Error,
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart},
 };
@@ -39,20 +38,6 @@ const TRACING_INFO_FREQUENCY: usize = 50;
 
 // ---------- Helpers ----------
 
-/// Error conversion helper function
-fn e2s<E: ::core::error::Error>(value: E) -> String {
-    value.to_string()
-}
-
-/// This is to wrap S3 operations and force the Result::Err variant to be an S3Error instead of an SdkError.
-/// This is because SdkError, when stringified, are utter useless shit.
-async fn s3_exec<T, E>(fut: impl Future<Output = Result<T, E>>) -> Result<T, S3Error>
-where
-    S3Error: From<E>,
-{
-    Ok(fut.await?)
-}
-
 macro_rules! intermitent_tracing {
     ($index:ident, $($tt:tt)+) => {
         if $index as usize % TRACING_INFO_FREQUENCY == 0 {
@@ -61,6 +46,40 @@ macro_rules! intermitent_tracing {
             tracing::event!(tracing::Level::DEBUG, $($tt)+);
         }
     };
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Error {
+    #[error("s3 error: {0}")]
+    S3(#[from] aws_sdk_s3::Error),
+    #[error("s3 bytestream error: {0}")]
+    S3ByteStream(#[from] aws_sdk_s3::primitives::ByteStreamError),
+    #[error(transparent)]
+    Zip(#[from] zip::result::ZipError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("Task panicked: {0}")]
+    Join(#[from] tokio::task::JoinError),
+    #[error("{0}")]
+    Custom(String),
+}
+impl<E, R> From<aws_sdk_s3::error::SdkError<E, R>> for Error
+where
+    aws_sdk_s3::error::SdkError<E, R>: Into<aws_sdk_s3::Error>,
+{
+    fn from(err: aws_sdk_s3::error::SdkError<E, R>) -> Self {
+        Error::S3(err.into())
+    }
+}
+impl From<&str> for Error {
+    fn from(err: &str) -> Self {
+        Error::Custom(err.to_owned())
+    }
+}
+impl From<String> for Error {
+    fn from(err: String) -> Self {
+        Error::Custom(err)
+    }
 }
 
 // ---------- Event ----------
@@ -80,12 +99,10 @@ async fn download_file(
     bucket: String,
     key: String,
     memory_semaphore: Option<Arc<Semaphore>>,
-) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>), String> {
+) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>), Error> {
     debug!("Downloading file");
 
-    let mut response = s3_exec(s3().get_object().bucket(bucket).key(key).send())
-        .await
-        .map_err(e2s)?;
+    let mut response = s3().get_object().bucket(bucket).key(key).send().await?;
 
     let expected_size = response
         .content_length()
@@ -115,7 +132,7 @@ async fn download_file(
     // resulting in a minimal overhead per-download task of the S3 chunk_size (16KB from my tests).
     let mut data = Vec::with_capacity(expected_size);
     while let Some(chunk_result) = response.body.next().await {
-        let chunk = chunk_result.map_err(e2s)?;
+        let chunk = chunk_result?;
         data.extend_from_slice(&chunk);
     }
 
@@ -160,7 +177,10 @@ fn spawn_download_job(
                     download_file(i, bucket_name, key, Some(memory_semaphore)).await?;
 
                 debug!("Download job for {filename} completed");
-                tx.send((filename, data, memory_permits)).map_err(e2s)
+                Ok::<_, Error>(
+                    tx.send((filename, data, memory_permits))
+                        .map_err(|e| e.to_string())?,
+                )
             });
         }
     })
@@ -239,7 +259,7 @@ fn spawn_zip_job(
 fn spawn_upload_jobs(
     mut reader: Reader,
     multipart_upload: MultipartUpload,
-) -> tokio::task::JoinHandle<Result<Vec<CompletedPart>, String>> {
+) -> tokio::task::JoinHandle<Result<Vec<CompletedPart>, Error>> {
     tokio::spawn(async move {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS));
 
@@ -307,7 +327,7 @@ struct MultipartUpload {
 ///
 /// Returns an error string if the multipart upload cannot be started
 #[instrument]
-async fn start_multipart_upload(job_info: JobInfo) -> Result<MultipartUpload, String> {
+async fn start_multipart_upload(job_info: JobInfo) -> Result<MultipartUpload, Error> {
     let JobInfo {
         bucket_name,
         archive_key,
@@ -316,15 +336,13 @@ async fn start_multipart_upload(job_info: JobInfo) -> Result<MultipartUpload, St
 
     info!("Starting multipart upload");
 
-    let response = s3_exec(
-        s3().create_multipart_upload()
-            .bucket(&*bucket_name)
-            .key(&*archive_key)
-            .content_type("application/zip")
-            .send(),
-    )
-    .await
-    .map_err(e2s)?;
+    let response = s3()
+        .create_multipart_upload()
+        .bucket(&*bucket_name)
+        .key(&*archive_key)
+        .content_type("application/zip")
+        .send()
+        .await?;
 
     let upload_id = response
         .upload_id
@@ -359,20 +377,18 @@ async fn upload_part(
     multipart_upload: MultipartUpload,
     part_number: i32,
     data: Vec<u8>,
-) -> Result<CompletedPart, String> {
+) -> Result<CompletedPart, Error> {
     debug!("data.len()" = data.len(), "Uploading part");
 
-    let response = s3_exec(
-        s3().upload_part()
-            .bucket(multipart_upload.bucket.as_ref())
-            .key(multipart_upload.key.as_ref())
-            .upload_id(multipart_upload.upload_id.as_ref())
-            .part_number(part_number)
-            .body(ByteStream::from(data))
-            .send(),
-    )
-    .await
-    .map_err(e2s)?;
+    let response = s3()
+        .upload_part()
+        .bucket(multipart_upload.bucket.as_ref())
+        .key(multipart_upload.key.as_ref())
+        .upload_id(multipart_upload.upload_id.as_ref())
+        .part_number(part_number)
+        .body(ByteStream::from(data))
+        .send()
+        .await?;
 
     let etag = response.e_tag.ok_or("No ETag in upload part response")?;
 
@@ -398,7 +414,7 @@ async fn upload_part(
 async fn complete_multipart_upload(
     multipart_upload: MultipartUpload,
     mut completed_parts: Vec<CompletedPart>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     // Sort parts by part number
     completed_parts.sort_by_key(|part| part.part_number());
 
@@ -411,22 +427,19 @@ async fn complete_multipart_upload(
         .set_parts(Some(completed_parts))
         .build();
 
-    s3_exec(
-        s3().complete_multipart_upload()
-            .bucket(multipart_upload.bucket.as_ref())
-            .key(multipart_upload.key.as_ref())
-            .upload_id(multipart_upload.upload_id.as_ref())
-            .multipart_upload(completed_upload)
-            .send(),
-    )
-    .await
-    .map_err(e2s)?;
+    s3().complete_multipart_upload()
+        .bucket(multipart_upload.bucket.as_ref())
+        .key(multipart_upload.key.as_ref())
+        .upload_id(multipart_upload.upload_id.as_ref())
+        .multipart_upload(completed_upload)
+        .send()
+        .await?;
 
     info!("Multipart upload completed successfully");
     Ok(())
 }
 #[instrument(skip(filenames))]
-async fn create_multipart_archive(filenames: Vec<String>, job_info: JobInfo) -> Result<(), String> {
+async fn create_multipart_archive(filenames: Vec<String>, job_info: JobInfo) -> Result<(), Error> {
     info!(
         "filenames.len()" = filenames.len(),
         "Creating multipart archive"
@@ -462,10 +475,10 @@ async fn create_multipart_archive(filenames: Vec<String>, job_info: JobInfo) -> 
     let completed_parts = match upload_handle.await {
         Ok(Ok(parts)) => parts,
         Ok(Err(e)) => {
-            return Err(format!("Upload job failed: {}", e));
+            return Err(format!("Upload job failed: {}", e))?;
         }
         Err(e) => {
-            return Err(format!("Upload job panicked: {}", e));
+            return Err(format!("Upload job panicked: {}", e))?;
         }
     };
 
@@ -485,7 +498,7 @@ async fn create_multipart_archive(filenames: Vec<String>, job_info: JobInfo) -> 
 ///
 /// Returns an error string if any page request fails.
 #[instrument]
-async fn list_files(bucket: String, key_prefix: &str) -> Result<Vec<String>, String> {
+async fn list_files(bucket: String, key_prefix: &str) -> Result<Vec<String>, Error> {
     info!("Listing files");
 
     // Ensure the prefix passed to S3 ends with `/` so we list only objects
@@ -502,11 +515,7 @@ async fn list_files(bucket: String, key_prefix: &str) -> Result<Vec<String>, Str
     let mut filenames = Vec::new();
 
     while let Some(page) = paginator.next().await {
-        for object in page
-            .map_err(|e| e2s(S3Error::from(e)))?
-            .contents
-            .unwrap_or_default()
-        {
+        for object in page?.contents.unwrap_or_default() {
             let Some(key) = object.key else {
                 continue;
             };

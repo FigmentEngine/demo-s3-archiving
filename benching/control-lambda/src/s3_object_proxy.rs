@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use tracing::{debug, error, info, instrument, trace};
 
-use crate::{ControlError, s3_exec};
+use crate::ControlError;
 
 type Offset = usize;
 const MIN_WINDOW_SIZE: usize = 16 * 1024 * 1024;
@@ -171,7 +171,12 @@ impl S3ObjectReader {
         bucket: String,
         key: String,
     ) -> Result<Self, ControlError> {
-        let resp = s3_exec(client.head_object().bucket(&bucket).key(&key).send()).await?;
+        let resp = client
+            .head_object()
+            .bucket(&bucket)
+            .key(&key)
+            .send()
+            .await?;
         let object_size = resp.content_length.expect("can it really be absent?") as usize;
         info!(
             object_size,
@@ -190,15 +195,13 @@ impl S3ObjectReader {
                     range_start,
                     range_end_inclusive, range_len, "fetching S3 byte range"
                 );
-                let mut resp = s3_exec(
-                    client
-                        .get_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .range(format!("bytes={range_start}-{range_end_inclusive}"))
-                        .send(),
-                )
-                .await?;
+                let mut resp = client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .range(format!("bytes={range_start}-{range_end_inclusive}"))
+                    .send()
+                    .await?;
                 // I DO NOT use the `response.body.collect()` helper here because it allocates
                 // internally a lot of intermediate buffers that amplify the memory footprint
                 // of the download process x3 (a 50MB photo download results in ~150MB of memory consumption).

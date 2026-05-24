@@ -16,7 +16,6 @@ mod s3_object_proxy;
 
 use std::collections::HashSet;
 
-use aws_sdk_s3::Error as S3Error;
 use awssdk_instrumentation::lambda::{LambdaError, LambdaEvent};
 use serde::Deserialize;
 use serde_json::Value;
@@ -70,17 +69,17 @@ pub enum ControlError {
     ChannelClosed,
 }
 
-// // Centralized mapping for any AWS SDK S3 error (List, Get, Head, byte-stream
-// // chunk errors, ...). Anything that comes from the S3 client/stream funnels
-// // through here so we have a single source of truth for S3 -> ControlError.
-// impl<E> From<E> for ControlError
-// where
-//     E: Into<aws_sdk_s3::Error> + ProvideErrorMetadata,
-// {
-//     fn from(err: E) -> Self {
-//         ControlError::S3(err.into())
-//     }
-// }
+// Centralized mapping for any AWS SDK S3 error (List, Get, Head, byte-stream
+// chunk errors, ...). Anything that comes from the S3 client/stream funnels
+// through here so we have a single source of truth for S3 -> ControlError.
+impl<E, R> From<aws_sdk_s3::error::SdkError<E, R>> for ControlError
+where
+    aws_sdk_s3::error::SdkError<E, R>: Into<aws_sdk_s3::Error>,
+{
+    fn from(err: aws_sdk_s3::error::SdkError<E, R>) -> Self {
+        ControlError::S3(err.into())
+    }
+}
 
 // ---------- Entry point ----------
 
@@ -149,11 +148,8 @@ async fn list_expected(
     files_prefix: &str,
     expected_object_count: usize,
 ) -> Result<HashSet<String>, ControlError> {
-    let prefix = if files_prefix.ends_with('/') {
-        files_prefix.to_string()
-    } else {
-        format!("{files_prefix}/")
-    };
+    let prefix = format!("{files_prefix}/");
+
     debug!(%prefix, "computed listing prefix");
 
     let mut set = HashSet::with_capacity(expected_object_count);
@@ -161,10 +157,10 @@ async fn list_expected(
     let mut page_index: usize = 0;
     loop {
         let mut req = s3().list_objects_v2().bucket(bucket).prefix(&prefix);
-        if let Some(c) = continuation.as_deref() {
+        if let Some(c) = continuation {
             req = req.continuation_token(c);
         }
-        let resp = s3_exec(req.send()).await?;
+        let resp = req.send().await?;
 
         let page_len = resp.contents().len();
         for obj in resp.contents() {
@@ -283,13 +279,6 @@ fn to_hex(bytes: &[u8]) -> String {
         let _ = write!(s, "{:02x}", byte);
     }
     s
-}
-
-async fn s3_exec<T, E>(fut: impl Future<Output = Result<T, E>>) -> Result<T, S3Error>
-where
-    S3Error: From<E>,
-{
-    Ok(fut.await?)
 }
 
 // This macro from `awssdk-instrumentation` generates the entire main() function:

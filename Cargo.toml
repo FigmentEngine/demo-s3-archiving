@@ -13,6 +13,7 @@ tokio = { version = "1", features = ["macros", "signal", "rt-multi-thread", "syn
 tracing = { version = "0.1"}
 
 rand = "0.9"
+fastrand = "2"
 rand_distr = "0.5"
 zip = { version = "5.1", default-features = false }
 

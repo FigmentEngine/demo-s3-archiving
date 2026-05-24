@@ -22,3 +22,5 @@ serde = { version = "1", features = ["derive"] }
 
 # ZIP generation
 zip = { version = "5.1", default-features = false }
+
+thiserror = "2"

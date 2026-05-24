@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: 2010-09-09
 Transform: AWS::Serverless-2016-10-31
-Description: Benching stack — S3 bucket of test objects, bucket-filler custom resource, archive control Lambda and orchestration Step Function
+Description: Benching stack with S3 bucket of test objects, bucket-filler custom resource, archive control Lambda and orchestration Step Function
 
 # This stack is the benchmarking infrastructure. Contributors adding a new
 # contender Lambda do NOT need to edit this file — see templates/contenders.yml
@@ -115,7 +115,7 @@ Resources:
       FunctionName: !Sub ${ProjectName}-fill-bucket
       CodeUri: ../benching/fill-bucket
       Runtime: provided.al2023
-      MemorySize: 512
+      MemorySize: 384
       Timeout: 600
       Handler: rust.handler
       Architectures:

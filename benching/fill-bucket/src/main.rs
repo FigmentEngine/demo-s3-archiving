@@ -29,7 +29,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{error, info, instrument};
+use tracing::{debug, error, info, instrument};
 
 // ---------- Tunables ----------
 const SIZE_STDDEV: usize = 1 * 1024 * 1024;
@@ -194,9 +194,17 @@ async fn fill(props: ResourceProperties) -> Result<(), LambdaError> {
 
     let mut remaining_size_budget = object_count * object_size;
     let mut rng = rand::rng();
+    let mut fast_rng = fastrand::Rng::new();
     for remaining_objects in (1..=object_count).rev() {
         if remaining_objects % 100 == 0 || remaining_objects < 100 {
             info!(
+                remaining_objects,
+                remaining_size_budget,
+                "spawned {}/{object_count} uploads",
+                object_count - remaining_objects
+            );
+        } else {
+            debug!(
                 remaining_objects,
                 remaining_size_budget,
                 "spawned {}/{object_count} uploads",
@@ -212,10 +220,13 @@ async fn fill(props: ResourceProperties) -> Result<(), LambdaError> {
             remaining_size_budget
         };
         remaining_size_budget -= size;
+        debug!(size, "size sampled");
 
         // Generate random content.
-        let mut buf = vec![0u8; size];
-        rng.fill(buf.as_mut_slice());
+        let buf: Vec<u8> = core::iter::repeat_with(|| fast_rng.u8(..))
+            .take(size)
+            .collect();
+        debug!("buf created and filled");
 
         let key_prefix = key_prefix.clone();
         let bucket_name = bucket_name.clone();
@@ -234,6 +245,7 @@ async fn fill(props: ResourceProperties) -> Result<(), LambdaError> {
     Ok(())
 }
 
+#[instrument(skip(rng))]
 fn sample_size<R: Rng + ?Sized>(
     rng: &mut R,
     remaining_size_budget: usize,
@@ -252,10 +264,13 @@ fn sample_size<R: Rng + ?Sized>(
     v.clamp(minimum_size, maximum_size)
 }
 
+#[instrument(skip(buf))]
 async fn upload_one(buf: Vec<u8>, bucket: String, prefix: &str) -> Result<(), LambdaError> {
     // SHA256 of the random content -> key.
+
     let digest = Sha256::digest(&buf);
     let hex = to_hex(&digest);
+    debug!(hex, "digest computed");
 
     s3_exec(
         s3().put_object()
