@@ -32,14 +32,19 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, instrument};
 
 // ---------- Tunables ----------
+/// Standard deviation (in bytes) of the normal distribution used to sample object sizes.
 const SIZE_STDDEV: usize = 1 * 1024 * 1024;
-const MAX_DEVIATION: usize = 3 * SIZE_STDDEV; // +/- 3sigma;
+/// Maximum allowed deviation from the per-object mean size (±3σ clamp).
+const MAX_DEVIATION: usize = 3 * SIZE_STDDEV;
+/// Absolute floor for any sampled object size, regardless of the distribution clamp.
 const MIN_FILE_SIZE: usize = 512 * 1024; // 512KB;
 
+/// Maximum number of in-flight S3 `PutObject` requests at any one time.
 const CONCURRENT_UPLOADS: usize = 20;
 
 // ---------- CFN custom resource event types ----------
 
+/// Deserialized `ResourceProperties` payload from the CFN custom resource event.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 struct ResourceProperties {
@@ -75,6 +80,7 @@ enum Work {
 
 // ---------- Entry point ----------
 
+/// Lambda entry point: dispatches CFN Create/Update/Delete events to [`fill`] and/or [`empty`].
 #[instrument(skip_all, fields(request_type))]
 async fn handler(
     event: LambdaEvent<CloudFormationCustomResourceRequest<ResourceProperties, ResourceProperties>>,
@@ -175,6 +181,10 @@ async fn handler(
 
 // ---------- Fill logic ----------
 
+/// Spawns up to [`CONCURRENT_UPLOADS`] concurrent random-object uploads under the key prefix.
+///
+/// Total byte budget is distributed across `object_count` objects using [`sample_size`],
+/// ensuring the aggregate size matches `object_count × object_size_mb`.
 #[instrument]
 async fn fill(props: ResourceProperties) -> Result<(), LambdaError> {
     info!(
@@ -245,6 +255,8 @@ async fn fill(props: ResourceProperties) -> Result<(), LambdaError> {
     Ok(())
 }
 
+/// Samples a single object size from a normal distribution centered on the per-object mean of
+/// the remaining budget, clamped to `[max(mean − MAX_DEVIATION, MIN_FILE_SIZE), mean + MAX_DEVIATION]`.
 #[instrument(skip(rng))]
 fn sample_size<R: Rng + ?Sized>(
     rng: &mut R,
@@ -264,6 +276,7 @@ fn sample_size<R: Rng + ?Sized>(
     v.clamp(minimum_size, maximum_size)
 }
 
+/// Computes the SHA256 of `buf` and PUTs it to S3 under `<prefix>/<sha256_hex>`.
 #[instrument(skip(buf))]
 async fn upload_one(buf: Vec<u8>, bucket: String, prefix: &str) -> Result<(), LambdaError> {
     // SHA256 of the random content -> key.
@@ -355,6 +368,7 @@ async fn empty(props: ResourceProperties) -> Result<(), LambdaError> {
 
 // ---------- cfn-response ----------
 
+/// PUTs the CFN response body to the presigned `response_url` supplied in the event.
 async fn send_cfn_response(
     common: CfnCommon,
     status: CloudFormationCustomResourceResponseStatus,
@@ -390,6 +404,7 @@ async fn send_cfn_response(
 }
 
 // ---------- Hex (hand-rolled) ----------
+/// Encodes a byte slice as a lowercase hexadecimal string.
 fn to_hex(bytes: &[u8]) -> String {
     use core::fmt::Write;
     let mut s = String::with_capacity(2 * bytes.len());
@@ -399,8 +414,7 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// This is to wrap S3 operations and force the Result::Err variant to be an S3Error instead of an SdkError.
-/// This is because SdkError, when stringified, are utter useless shit.
+/// Awaits an S3 SDK future and converts any `SdkError` into an `S3Error` for human-readable error messages.
 async fn s3_exec<T, E>(fut: impl Future<Output = Result<T, E>>) -> Result<T, S3Error>
 where
     S3Error: From<E>,

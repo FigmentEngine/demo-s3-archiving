@@ -1,14 +1,28 @@
+//! Single-producer single-consumer ring buffer of fixed-size byte slabs.
+//!
+//! Designed to stream bytes from a synchronous [`std::io::Write`] producer ([`Writer`]) to an
+//! async consumer ([`Reader`]) without per-chunk allocation. The buffer is one contiguous
+//! `Vec<u8>` carved into `N` slabs; each slab cycles through `Free → Filling → Ready → Free`
+//! states tracked by an atomic per-slab cell. When all slabs are `Ready` (consumer is behind),
+//! the writer busy-spins with 10 ms sleeps — callers must therefore run [`Writer`] inside
+//! `tokio::task::spawn_blocking`. Buffer recycling is driven by [`Drop`] on [`SlabLease`].
+
 use std::{iter, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
+/// Lifecycle state of a single slab in the ring buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum SlabState {
+    /// Available for the writer to claim.
     Free = 0,
+    /// Currently being written by the [`Writer`].
     Filling = 1,
+    /// Sealed and waiting for (or held by) the [`Reader`].
     Ready = 2,
 }
+/// Atomic per-slab state cell shared between the writer and the consumer.
 mod slab {
     use super::SlabState;
     use std::sync::atomic::{
@@ -16,15 +30,20 @@ mod slab {
         Ordering::{Acquire, Relaxed, Release},
     };
 
+    /// Holds the atomic [`SlabState`] for one slab.
     pub struct Slab {
         state: AtomicU8,
     }
     impl Slab {
+        /// Creates a slab with the given initial state.
         pub fn new(state: SlabState) -> Self {
             Self {
                 state: AtomicU8::new(state as u8),
             }
         }
+
+        /// Loads the current state with `Acquire` ordering so the caller sees all writes
+        /// that the thread which last set the state had made before releasing it.
         pub fn state(&self) -> SlabState {
             // SAFETY:
             // - SlabState is repr(u8)
@@ -32,6 +51,8 @@ mod slab {
             unsafe { std::mem::transmute(self.state.load(Acquire)) }
         }
 
+        /// Atomically swaps to `new_state` with `Release` ordering, publishing all preceding
+        /// writes to the slab data before the state change becomes visible to other threads.
         pub fn swap_state(&self, new_state: SlabState) -> SlabState {
             let prev = self.state.swap(new_state as u8, Release);
             // SAFETY:
@@ -39,12 +60,16 @@ mod slab {
             // - the content of prev is guaranteed to correspond to a SlabState
             unsafe { std::mem::transmute(prev) }
         }
+
+        /// Sets the state with `Relaxed` ordering; use only during single-threaded initialization.
         pub fn set_state(&self, new_state: SlabState) {
             self.state.store(new_state as u8, Relaxed);
         }
     }
 }
 use slab::Slab;
+
+/// Shared backing store for the ring buffer; not used directly — construct via [`SlabRing::new`].
 pub struct SlabRing {
     buf: Vec<u8>, // single contiguous allocation
     slabs: Vec<Slab>,
@@ -53,6 +78,11 @@ pub struct SlabRing {
 }
 
 impl SlabRing {
+    /// Allocates the ring buffer and returns a `(Writer, Reader)` pair.
+    ///
+    /// The backing `Vec<u8>` is allocated at full capacity with `set_len` (contents are
+    /// uninitialised but never read before being written). The first slab is pre-marked
+    /// `Filling` so the [`Writer`] can begin immediately without claiming a free slab.
     pub fn new(slab_size: usize, slab_count: usize) -> (Writer, Reader) {
         info!(
             "Creating SlabRing with slab_size={}, slab_count={}",
@@ -92,16 +122,22 @@ impl SlabRing {
         )
     }
 
+    /// Returns `true` if the ring was constructed with zero capacity (the `Default` writer case).
     fn is_zero_space(&self) -> bool {
         self.buf.is_empty()
     }
 
+    /// Returns the byte offset of `slab_idx` within the backing buffer.
     #[inline]
     fn slab_start(&self, slab_idx: usize) -> usize {
         slab_idx * self.slab_size
     }
 }
 
+/// Handle to a sealed slab handed to the consumer.
+///
+/// While a `SlabLease` is alive the slab remains `Ready` and the writer cannot reclaim it.
+/// Dropping the lease transitions the slab back to `Free`, making it available to the writer.
 pub struct SlabLease {
     ring: Arc<SlabRing>,
     slab_idx: usize,
@@ -110,11 +146,13 @@ pub struct SlabLease {
 }
 
 impl SlabLease {
-    /// Read-only slice for upload
+    /// Borrows the sealed slab data in place.
     pub fn as_slice<'a>(&'a self) -> &'a [u8] {
         &self.ring.buf[self.data.clone()]
     }
-    /// Read-only slice for upload
+    /// Copies the slab data into an owned `Vec<u8>`.
+    ///
+    /// Used by the uploader because the AWS SDK requires an owned buffer.
     pub fn into_vec(self) -> Vec<u8> {
         self.as_slice().to_vec()
     }
@@ -140,11 +178,13 @@ impl Drop for SlabLease {
     }
 }
 
+/// Async consumer side of the ring buffer; yields sealed [`SlabLease`]s as they become ready.
 pub struct Reader {
     ready_rx: mpsc::UnboundedReceiver<SlabLease>,
 }
 
 impl Reader {
+    /// Waits for the next sealed slab, returning `None` when the [`Writer`] has been dropped.
     pub async fn recv(&mut self) -> Option<SlabLease> {
         debug!("Reader waiting for next SlabLease");
         let lease = self.ready_rx.recv().await;
@@ -161,12 +201,23 @@ impl Reader {
     }
 }
 
+/// Sync producer side of the ring buffer; implements [`std::io::Write`].
+///
+/// `write` fills the current slab and spills into subsequent slabs as needed.
+/// When all slabs are `Ready` (consumer is behind), [`Writer::find_and_claim_free_slab`]
+/// busy-spins with 10 ms sleeps — callers must therefore run the writer inside
+/// `tokio::task::spawn_blocking`. `flush` seals the current (possibly partial) slab so the
+/// consumer sees the trailing bytes after the ZIP central directory is written.
 pub struct Writer {
     ring: Arc<SlabRing>,
     slab_idx: usize,
     offset: usize, // bytes written in current slab
 }
 impl Default for Writer {
+    /// Creates a zero-capacity [`Writer`] backed by an empty [`SlabRing`].
+    ///
+    /// Required because [`zipper::Zipper`] has a `W: Default` bound (the `zip` crate's
+    /// `StreamWriter` swaps the inner writer out on `finish`).
     fn default() -> Self {
         SlabRing::new(0, 0).0
     }
@@ -242,6 +293,7 @@ impl Writer {
 
     //     return immediate_free_space + currently_free_slabs_count * self.ring.slab_size >= len;
     // }
+    /// Transitions the current slab from `Filling` to `Ready` and sends a [`SlabLease`] to the consumer.
     fn seal(&mut self) {
         debug!(
             "Sealing slab_idx={} with {} bytes",
@@ -269,6 +321,7 @@ impl Writer {
         }
     }
 
+    /// Claims the next free slab (blocking until one is available) and resets the write offset.
     fn advance(&mut self) {
         // Advance to the next slab if possible
         debug!("Advancing from slab_idx={}", self.slab_idx);
@@ -278,11 +331,16 @@ impl Writer {
         debug!("Successfully advanced to slab_idx={}", self.slab_idx);
     }
 
+    /// Seals the current slab and advances to the next free one.
     fn seal_and_advance(&mut self) {
         self.seal();
         self.advance();
     }
 
+    /// Scans the ring for a `Free` slab, atomically claims it as `Filling`, and returns its index.
+    ///
+    /// Busy-spins with 10 ms sleeps when no slab is free; this is why the caller must be on a
+    /// blocking thread.
     fn find_and_claim_free_slab(&self) -> usize {
         debug!("Attempting to find a free slab_idx");
 

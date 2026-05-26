@@ -1,3 +1,9 @@
+//! `Read + Seek` adapter over an S3 object for the `zip` crate.
+//!
+//! Maintains a sliding in-memory window of bytes, prefetches the next window in parallel via a
+//! background tokio task, and serves `Read::read` calls from the current window — avoiding a
+//! full download of the archive before parsing begins.
+
 use std::{
     collections::BTreeSet,
     io::{Read, Seek},
@@ -11,16 +17,22 @@ use tracing::{debug, error, info, instrument, trace};
 
 use crate::ControlError;
 
+/// Byte offset within the S3 object.
 type Offset = usize;
+/// Minimum bytes requested per S3 `GetObject` range request (16 MiB).
 const MIN_WINDOW_SIZE: usize = 16 * 1024 * 1024;
+/// Growth cap for the doubling window strategy (256 MiB).
 const MAX_WINDOW_SIZE: usize = 256 * 1024 * 1024;
 
+/// Newtype around `Range<Offset>` with total ordering (by `start`, then `end`) so it can live in a `BTreeSet`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WindowRange(Range<Offset>);
 impl WindowRange {
+    /// Constructs a range from a start offset and a byte length.
     fn new(start_position: Offset, length: usize) -> Self {
         Self::from(start_position..start_position + length)
     }
+    /// Returns `true` if `self` entirely contains `other`.
     fn covers(&self, other: &Self) -> bool {
         self.start <= other.start && self.end >= other.end
     }
@@ -82,6 +94,7 @@ impl PartialOrd for WindowRange {
 //     }
 // }
 
+/// Ordered set of [`WindowRange`] used to track in-flight prefetch requests and avoid duplicates.
 #[derive(Debug, Clone, Default)]
 struct WindowRangeSet(BTreeSet<WindowRange>);
 impl Deref for WindowRangeSet {
@@ -96,6 +109,7 @@ impl DerefMut for WindowRangeSet {
     }
 }
 impl WindowRangeSet {
+    /// Finds the set entry whose range contains `position`, probing the two `BTreeSet` neighbours of the query point.
     fn get_position_cover(&self, position: Offset) -> Option<&WindowRange> {
         if let Some(candidate) = self
             .range(..WindowRange(position..position + 1))
@@ -111,6 +125,7 @@ impl WindowRangeSet {
             None
         }
     }
+    /// Finds the set entry that fully covers `range`, using the same neighbour-probe trick as [`Self::get_position_cover`].
     fn get_range_cover(&self, range: WindowRange) -> Option<&WindowRange> {
         if let Some(candidate) = self.range(..range.clone()).next_back()
             && candidate.covers(&range)
@@ -126,6 +141,9 @@ impl WindowRangeSet {
     }
 }
 
+/// A downloaded byte range held in memory; pairs the range with its buffer.
+///
+/// The manual `Debug` impl omits the buffer contents to avoid flooding logs.
 struct S3ObjectReaderWindow {
     range: WindowRange,
     buf: Vec<u8>,
@@ -139,32 +157,48 @@ impl core::fmt::Debug for S3ObjectReaderWindow {
     }
 }
 impl S3ObjectReaderWindow {
+    /// Inclusive start byte offset of this window within the S3 object.
     fn start_position(&self) -> Offset {
         self.range.start
     }
+    /// Exclusive end byte offset of this window within the S3 object.
     fn end_position_excl(&self) -> Offset {
         self.range.end
     }
+    /// Returns the byte range covered by this window.
     fn position_range(&self) -> WindowRange {
         WindowRange::from(self.start_position()..self.end_position_excl())
     }
+    /// Returns `true` if this window holds the byte at `position`.
     fn contains_position(&self, position: Offset) -> bool {
         self.position_range().contains(&position)
     }
+    /// Slice of the buffer starting at the given absolute `position`.
     fn buf_from(&self, position: Offset) -> &[u8] {
         &self.buf[(position - self.start_position())..]
     }
 }
 
+/// `Read + Seek` adapter over an S3 object, backed by a sliding in-memory window and a
+/// background fetcher task.
 pub struct S3ObjectReader {
+    /// The window currently serving reads.
     current_window: Option<S3ObjectReaderWindow>,
+    /// Current read cursor (byte offset into the S3 object).
     position: usize,
+    /// Total S3 object size in bytes, from `HeadObject`.
     object_size: usize,
+    /// Sends range requests to the background fetcher task.
     windows_request_tx: UnboundedSender<WindowRange>,
+    /// Receives completed windows from the background fetcher task.
     windows_rx: Receiver<S3ObjectReaderWindow>,
+    /// Ranges currently being fetched; used to deduplicate requests.
     incoming_windows: WindowRangeSet,
 }
 impl S3ObjectReader {
+    /// Issues `HeadObject` for the object size, spawns the background fetcher task, and returns
+    /// the reader. Chunks are collected manually into a pre-allocated buffer to avoid the ~3×
+    /// memory amplification of `body.collect()`.
     #[instrument(skip(client), fields(%bucket, %key))]
     pub async fn create(
         client: aws_sdk_s3::Client,
@@ -239,6 +273,10 @@ impl S3ObjectReader {
         })
     }
 
+    /// Returns the window covering `self.position`, blocking on the channel if necessary.
+    ///
+    /// Side-effect: triggers prefetch of the next window via [`Self::ask_next_window`] when the
+    /// current window already covers the position. Panics if the fetcher channel is closed.
     #[instrument(skip_all, fields(position = self.position))]
     fn current_window(&mut self) -> &S3ObjectReaderWindow {
         use std::sync::mpsc::TryRecvError;
@@ -307,6 +345,7 @@ impl S3ObjectReader {
         }
     }
 
+    /// Requests the window immediately after the current one, doubling the window size up to [`MAX_WINDOW_SIZE`].
     fn ask_next_window(&mut self) {
         if let Some(ref cw) = self.current_window {
             self.ask_window(
@@ -317,9 +356,13 @@ impl S3ObjectReader {
             self.ask_position_window();
         }
     }
+    /// Requests a [`MIN_WINDOW_SIZE`]-sized window starting at the current `position`.
     fn ask_position_window(&mut self) {
         self.ask_window(self.position, MIN_WINDOW_SIZE);
     }
+    /// Clamps the requested range against `object_size` (with a [`MIN_WINDOW_SIZE`] fallback near
+    /// EOF), deduplicates against the current window and in-flight requests, then sends on
+    /// `windows_request_tx`.
     #[instrument(skip(self), fields(object_size = self.object_size))]
     fn ask_window(&mut self, offset: Offset, size: usize) {
         let range = if offset + size > self.object_size {
@@ -361,6 +404,8 @@ impl S3ObjectReader {
     }
 }
 
+/// Copies bytes from the current window into the caller's buffer, advancing `position`.
+/// Returns at most one window's worth of bytes per call.
 impl Read for S3ObjectReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let position = self.position;
@@ -383,6 +428,8 @@ impl Read for S3ObjectReader {
         Ok(read_size)
     }
 }
+/// Updates `position` only; the next `read` call triggers a window fetch if needed.
+/// Uses saturating arithmetic to avoid overflow on out-of-bounds seeks.
 impl Seek for S3ObjectReader {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         match pos {

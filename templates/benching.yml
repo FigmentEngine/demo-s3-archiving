@@ -182,6 +182,10 @@ Resources:
               Action:
                 - s3:GetObject
               Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/archives/*
+            - Sid: DenyLogGroupCreation
+              Effect: Deny
+              Action: logs:CreateLogGroup
+              Resource: "*"
   ControlFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:

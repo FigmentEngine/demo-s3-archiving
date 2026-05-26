@@ -27,18 +27,23 @@ use crate::s3_object_proxy::S3ObjectReader;
 
 // ---------- Event ----------
 
+/// Step Function event payload for the control Lambda.
+///
+/// `expected_object_count` is a decimal string (as injected by the SFN) and must be parsed to `usize`.
 #[derive(Debug, Deserialize)]
 struct ControlEvent {
+    /// S3 key of the archive to validate.
     archive_key: String,
+    /// Expected number of objects in the source prefix, as a decimal string.
     expected_object_count: String,
 }
 
 // ---------- Errors ----------
-//
-// Keep all error mapping in one place: the `ControlError` enum and its `From`
-// impls below. If you need a new error category, add a variant here and a
-// single `From` impl rather than scattering `map_err` calls across the code.
 
+/// Typed error returned to Step Functions via Lambda's `errorMessage` field.
+///
+/// All error mapping is centralised here: add a variant and a `From` impl rather than
+/// scattering `map_err` calls across the codebase.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
     #[error("expected {1} test objects in bucket, found {0}")]
@@ -69,9 +74,7 @@ pub enum ControlError {
     ChannelClosed,
 }
 
-// Centralized mapping for any AWS SDK S3 error (List, Get, Head, byte-stream
-// chunk errors, ...). Anything that comes from the S3 client/stream funnels
-// through here so we have a single source of truth for S3 -> ControlError.
+/// Central funnel for any AWS SDK S3 error variant into [`ControlError::S3`].
 impl<E, R> From<aws_sdk_s3::error::SdkError<E, R>> for ControlError
 where
     aws_sdk_s3::error::SdkError<E, R>: Into<aws_sdk_s3::Error>,
@@ -83,21 +86,22 @@ where
 
 // ---------- Entry point ----------
 
+/// Lambda entry point.
+///
+/// Reads `BUCKET_NAME` and `FILES_PREFIX` env vars, parses the event, and dispatches to
+/// [`validate`]. On error, logs and propagates the [`ControlError`] so its `Display` reaches
+/// Step Functions.
 #[instrument(
     skip_all,
-    fields(archive_key, expected_object_count, bucket, files_prefix)
+    fields(payload = ?event.payload)
 )]
 async fn handler(event: LambdaEvent<ControlEvent>) -> Result<Value, LambdaError> {
     let archive_key = event.payload.archive_key;
     let expected_object_count = event.payload.expected_object_count.parse::<usize>()?;
-    tracing::Span::current().record("archive_key", archive_key.as_str());
-    tracing::Span::current().record("expected_object_count", expected_object_count);
 
     let bucket = std::env::var("BUCKET_NAME").map_err(|_| ControlError::EnvVar("BUCKET_NAME"))?;
     let files_prefix =
         std::env::var("FILES_PREFIX").map_err(|_| ControlError::EnvVar("FILES_PREFIX"))?;
-    tracing::Span::current().record("bucket", bucket.as_str());
-    tracing::Span::current().record("files_prefix", files_prefix.as_str());
 
     info!(%bucket, %files_prefix, %archive_key, expected_object_count, "control-lambda invoked");
 
@@ -111,6 +115,8 @@ async fn handler(event: LambdaEvent<ControlEvent>) -> Result<Value, LambdaError>
 
 // ---------- Validation ----------
 
+/// Two-phase validation: build the expected SHA256-name set via [`list_expected`], then verify
+/// the archive via [`validate_archive`]. Asserts the listed set size matches `expected_object_count`.
 #[instrument(skip_all, fields(bucket = %bucket, archive_key = %archive_key, expected_object_count))]
 async fn validate(
     bucket: &str,
@@ -142,6 +148,8 @@ async fn validate(
     Ok(())
 }
 
+/// Paginates `ListObjectsV2` under `{files_prefix}/`, strips the prefix from each key, and
+/// collects the remaining segment (treated as a SHA256 hex name) into a `HashSet<String>`.
 #[instrument(skip_all, fields(bucket = %bucket, files_prefix = %files_prefix, expected_object_count))]
 async fn list_expected(
     bucket: &str,
@@ -197,6 +205,9 @@ async fn list_expected(
     Ok(set)
 }
 
+/// Opens the archive via [`S3ObjectReader`], walks the central directory, then re-hashes each
+/// entry's content. Enforces: flat layout (no `/` in entry names), exactly one entry per expected
+/// name (no duplicates, no extras), and bit-exact content matching the SHA256-named entry.
 #[instrument(skip_all, fields(bucket = %bucket, archive_key = %archive_key, expected_count = expected.len()))]
 async fn validate_archive(
     bucket: &str,
@@ -272,6 +283,7 @@ async fn validate_archive(
 
 // ---------- Helpers ----------
 
+/// Lowercase hex encoder for `Sha256::finalize()` output. Avoids pulling a hex dependency.
 fn to_hex(bytes: &[u8]) -> String {
     use core::fmt::Write;
     let mut s = String::with_capacity(2 * bytes.len());
