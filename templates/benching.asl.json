@@ -1,5 +1,5 @@
 {
-  "Comment": "Benchmark the contender Lambdas: for each ARN run the lambda (timed), validate the produced archive with the control Lambda, then delete the archive. Outputs ordered success / failure lists.",
+  "Comment": "Benchmark the contender Lambdas: for each ARN run the lambda RunsPerContender times in parallel (timed), validate run-0's archive with the control Lambda, aggregate mean/stddev/min/max, then delete all archives. Outputs ordered success / failure lists.",
   "QueryLanguage": "JSONata",
   "StartAt": "BenchOverContenders",
   "States": {
@@ -9,7 +9,7 @@
       "ItemSelector": {
         "arn": "{% $states.context.Map.Item.Value %}"
       },
-      "MaxConcurrency": 10,
+      "MaxConcurrency": 0,
       "ItemProcessor": {
         "ProcessorConfig": {
           "Mode": "INLINE"
@@ -29,14 +29,15 @@
                 "ephemeral_storage_free_mb": 512
               }
             },
-            "Next": "DeriveArchiveKey"
+            "Next": "DeriveArchiveKeyBase"
           },
-          "DeriveArchiveKey": {
+          "DeriveArchiveKeyBase": {
             "Type": "Pass",
-            "Comment": "Derive the contender's function id from its ARN: '<lang>-<dev_id>', e.g. 'rust-jeremie-rodon'. The Function ARN basename is '${ProjectName}-<function_id>'.",
+            "Comment": "Derive archive_key_base from the ARN. Each run writes archives/<id>-<runIndex>.zip. Run indices 0..(RunsPerContender-1) are built as an array here.",
             "Assign": {
               "arn": "{% $states.input.arn %}",
-              "archive_key": "{% 'archives/' & $substringAfter($split($states.input.arn, ':')[6], '${ProjectName}-') & '.zip' %}"
+              "archive_key_base": "{% 'archives/' & $substringAfter($split($states.input.arn, ':')[6], '${ProjectName}-') %}",
+              "run_indices": "{% [0..${RunsPerContender}-1] %}"
             },
             "Next": "GetContenderConfig"
           },
@@ -53,81 +54,140 @@
               "memory_mb": "{% $states.result.MemorySize %}",
               "ephemeral_storage_mb": "{% $states.result.EphemeralStorage.Size %}"
             },
-            "Next": "StartTimer"
+            "Next": "RunContenderTimes"
           },
-          "StartTimer": {
-            "Type": "Pass",
-            "Assign": {
-              "started_ms": "{% $millis() %}"
+          "RunContenderTimes": {
+            "Type": "Map",
+            "Comment": "Run the contender RunsPerContender times in parallel. Each run writes to its own archive key (archive_key_base-<runIndex>.zip).",
+            "Items": "{% $run_indices %}",
+            "ItemSelector": {
+              "run_index": "{% $states.context.Map.Item.Value %}",
+              "arn": "{% $arn %}",
+              "archive_key": "{% $archive_key_base & '-' & $string($states.context.Map.Item.Value) & '.zip' %}",
+              "archive_key_base": "{% $archive_key_base %}"
             },
-            "Next": "InvokeContender"
-          },
-          "InvokeContender": {
-            "Type": "Task",
-            "Resource": "arn:aws:states:::lambda:invoke",
-            "Arguments": {
-              "FunctionName": "{% $arn %}",
-              "Payload": {
-                "bucket_name": "${BucketName}",
-                "files_prefix": "${FilesPrefix}",
-                "archive_key": "{% $archive_key %}"
+            "MaxConcurrency": 0,
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "StartRunTimer",
+              "States": {
+                "StartRunTimer": {
+                  "Type": "Pass",
+                  "Assign": {
+                    "run_started_ms": "{% $millis() %}",
+                    "archive_key": "{% $states.input.archive_key %}"
+                  },
+                  "Next": "InvokeContender"
+                },
+                "InvokeContender": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Arguments": {
+                    "FunctionName": "{% $states.input.arn %}",
+                    "Payload": {
+                      "bucket_name": "${BucketName}",
+                      "files_prefix": "${FilesPrefix}",
+                      "archive_key": "{% $archive_key %}"
+                    }
+                  },
+                  "Retry": [],
+                  "Catch": [
+                    {
+                      "ErrorEquals": [
+                        "States.Timeout",
+                        "Lambda.SdkClientException",
+                        "Lambda.TooManyRequestsException",
+                        "Lambda.ServiceException"
+                      ],
+                      "Next": "RecordRunFailure",
+                      "Output": {
+                        "reason": "{% 'timeout: ' & $states.errorOutput.Error & ' ' & $states.errorOutput.Cause %}"
+                      }
+                    },
+                    {
+                      "ErrorEquals": ["States.ALL"],
+                      "Next": "RecordRunFailure",
+                      "Output": {
+                        "reason": "{% 'crash: ' & $states.errorOutput.Error & ' ' & $states.errorOutput.Cause %}"
+                      }
+                    }
+                  ],
+                  "Next": "StopRunTimer"
+                },
+                "StopRunTimer": {
+                  "Type": "Pass",
+                  "Output": {
+                    "kind": "run_success",
+                    "archive_key": "{% $archive_key %}",
+                    "duration_ms": "{% $millis() - $run_started_ms %}"
+                  },
+                  "End": true
+                },
+                "RecordRunFailure": {
+                  "Type": "Pass",
+                  "Output": {
+                    "kind": "run_failure",
+                    "archive_key": "{% $archive_key %}",
+                    "reason": "{% $states.input.reason %}"
+                  },
+                  "End": true
+                }
               }
             },
-            "Retry": [],
-            "Catch": [
+            "Next": "AggregateRuns"
+          },
+          "AggregateRuns": {
+            "Type": "Pass",
+            "Comment": "Check for any run failures. On success compute mean/stddev/min/max over all run durations.",
+            "Assign": {
+              "run_results": "{% $states.input %}",
+              "contender_failed": "{% $boolean($states.input[kind='run_failure']) ? true : false %}",
+              "failure_reason": "{% ($res := $states.input[kind='run_failure'][0].reason ; $boolean($res) ? $res : null) %}",
+              "durations": "{% ($res := $states.input[kind='run_success'].duration_ms ; $boolean($res) ? [$res] : [] ) %}",
+              "archive_key_run0": "{% $archive_key_base & '-0.zip' %}",
+              "all_archive_keys": "{% $states.input.archive_key %}"
+            },
+            "Next": "CheckRunsSucceeded"
+          },
+          "CheckRunsSucceeded": {
+            "Type": "Choice",
+            "Choices": [
               {
-                "ErrorEquals": [
-                  "States.Timeout",
-                  "Lambda.SdkClientException",
-                  "Lambda.TooManyRequestsException",
-                  "Lambda.ServiceException"
-                ],
-                "Next": "RecordContenderFailure",
-                "Output": {
-                  "reason": "{% 'timeout: ' & $states.errorOutput.Error & ' ' & $states.errorOutput.Cause %}"
-                }
-              },
-              {
-                "ErrorEquals": ["States.ALL"],
-                "Next": "RecordContenderFailure",
-                "Output": {
-                  "reason": "{% 'crash: ' & $states.errorOutput.Error & ' ' & $states.errorOutput.Cause %}"
-                }
+                "Condition": "{% $contender_failed %}",
+                "Next": "RecordContenderFailureFromRuns"
               }
             ],
-            "Next": "StopTimer"
+            "Default": "InvokeControl"
           },
-          "RecordContenderFailure": {
+          "RecordContenderFailureFromRuns": {
             "Type": "Pass",
-            "Comment": "Contender either crashed or timed out — no archive to delete (or it may be a partial multipart, but the bucket lifecycle aborts those after 1 day).",
-            "Output": {
-              "kind": "failure",
-              "arn": "{% $arn %}",
-              "reason": "{% $states.input.reason %}"
-            },
-            "Next": "EndSuccess"
-          },
-          "StopTimer": {
-            "Type": "Pass",
+            "Comment": "At least one run failed — report the contender as failed and clean up all produced archives.",
             "Assign": {
-              "duration_ms": "{% $millis() - $started_ms %}"
+              "contender_result": {
+                "kind": "failure",
+                "arn": "{% $arn %}",
+                "reason": "{% $failure_reason %}"
+              }
             },
-            "Next": "InvokeControl"
+            "Next": "DeleteAllArchives"
           },
           "InvokeControl": {
             "Type": "Task",
+            "Comment": "Validate only run-0's archive for correctness. Timing is collected for all runs.",
             "Resource": "arn:aws:states:::lambda:invoke",
             "Arguments": {
               "FunctionName": "${ControlFunctionArn}",
               "Payload": {
-                "archive_key": "{% $archive_key %}",
+                "archive_key": "{% $archive_key_run0 %}",
                 "expected_object_count": "${TestFileCount}"
               }
             },
             "Catch": [
               {
                 "ErrorEquals": ["States.ALL"],
-                "Next": "EmitInvalid",
+                "Next": "RecordContenderInvalid",
                 "Output": {
                   "reason": "{% 'invalid: ' & ($exists($states.errorOutput.Cause) ? ($parse($states.errorOutput.Cause).errorMessage ? $parse($states.errorOutput.Cause).errorMessage : $states.errorOutput.Cause) : $states.errorOutput.Error) %}"
                 }
@@ -135,49 +195,91 @@
             ],
             "Next": "EmitSuccess"
           },
+          "RecordContenderInvalid": {
+            "Type": "Pass",
+            "Assign": {
+              "contender_result": {
+                "kind": "failure",
+                "arn": "{% $arn %}",
+                "reason": "{% $states.input.reason %}"
+              }
+            },
+            "Next": "DeleteAllArchives"
+          },
           "EmitSuccess": {
             "Type": "Pass",
-            "Output": {
-              "kind": "success",
-              "arn": "{% $arn %}",
-              "runtime": "{% $runtime %}",
-              "architecture": "{% $architecture %}",
-              "memory_mb": "{% $memory_mb %}",
-              "ephemeral_storage_mb": "{% $ephemeral_storage_mb %}",
-              "duration_ms": "{% $duration_ms %}",
-              "gb_second_compute": "{% ($duration_ms / 1000) * ($memory_mb / 1024) %}",
-              "gb_second_storage": "{% ($duration_ms / 1000) * (($ephemeral_storage_mb > $pricing.ephemeral_storage_free_mb ? $ephemeral_storage_mb - $pricing.ephemeral_storage_free_mb : 0) / 1024) %}",
-              "compute_rate_usd": "{% $lookup($pricing.gb_second_by_arch, $architecture) %}",
-              "storage_rate_usd": "{% $pricing.gb_second_storage %}",
-              "compute_price_usd": "{% (($duration_ms / 1000) * ($memory_mb / 1024)) * $lookup($pricing.gb_second_by_arch, $architecture) %}",
-              "storage_price_usd": "{% (($duration_ms / 1000) * (($ephemeral_storage_mb > $pricing.ephemeral_storage_free_mb ? $ephemeral_storage_mb - $pricing.ephemeral_storage_free_mb : 0) / 1024)) * $pricing.gb_second_storage %}",
-              "run_price_usd": "{% (($duration_ms / 1000) * ($memory_mb / 1024)) * $lookup($pricing.gb_second_by_arch, $architecture) + (($duration_ms / 1000) * (($ephemeral_storage_mb > $pricing.ephemeral_storage_free_mb ? $ephemeral_storage_mb - $pricing.ephemeral_storage_free_mb : 0) / 1024)) * $pricing.gb_second_storage %}"
+            "Comment": "Compute mean/stddev/min/max from the N run durations, then derive all pricing fields from the mean duration.",
+            "Assign": {
+              "duration_ms_mean": "{% $sum($durations) / $count($durations) %}",
+              "duration_ms_stddev": "{% $sqrt($sum($map($durations, function($d) { ($d - $sum($durations) / $count($durations)) * ($d - $sum($durations) / $count($durations)) })) / $count($durations)) %}",
+              "duration_ms_min": "{% $min($durations) %}",
+              "duration_ms_max": "{% $max($durations) %}",
+              "runs_count": "{% $count($durations) %}"
             },
-            "Next": "DeleteArchive"
+            "Next": "BuildSuccessResult"
           },
-          "EmitInvalid": {
+          "BuildSuccessResult": {
             "Type": "Pass",
-            "Output": {
-              "kind": "failure",
-              "arn": "{% $arn %}",
-              "reason": "{% $states.input.reason %}"
-            },
-            "Next": "DeleteArchive"
-          },
-          "DeleteArchive": {
-            "Type": "Task",
-            "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
-            "Arguments": {
-              "Bucket": "${BucketName}",
-              "Key": "{% $archive_key %}"
-            },
-            "Output": "{% $states.input %}",
-            "Catch": [
-              {
-                "ErrorEquals": ["States.ALL"],
-                "Next": "EndSuccess"
+            "Assign": {
+              "contender_result": {
+                "kind": "success",
+                "arn": "{% $arn %}",
+                "runtime": "{% $runtime %}",
+                "architecture": "{% $architecture %}",
+                "memory_mb": "{% $memory_mb %}",
+                "ephemeral_storage_mb": "{% $ephemeral_storage_mb %}",
+                "runs_count": "{% $runs_count %}",
+                "duration_ms": "{% $duration_ms_mean %}",
+                "duration_ms_stddev": "{% $duration_ms_stddev %}",
+                "duration_ms_min": "{% $duration_ms_min %}",
+                "duration_ms_max": "{% $duration_ms_max %}",
+                "gb_second_compute": "{% ($duration_ms_mean / 1000) * ($memory_mb / 1024) %}",
+                "gb_second_storage": "{% ($duration_ms_mean / 1000) * (($ephemeral_storage_mb > $pricing.ephemeral_storage_free_mb ? $ephemeral_storage_mb - $pricing.ephemeral_storage_free_mb : 0) / 1024) %}",
+                "compute_rate_usd": "{% $lookup($pricing.gb_second_by_arch, $architecture) %}",
+                "storage_rate_usd": "{% $pricing.gb_second_storage %}",
+                "compute_price_usd": "{% (($duration_ms_mean / 1000) * ($memory_mb / 1024)) * $lookup($pricing.gb_second_by_arch, $architecture) %}",
+                "storage_price_usd": "{% (($duration_ms_mean / 1000) * (($ephemeral_storage_mb > $pricing.ephemeral_storage_free_mb ? $ephemeral_storage_mb - $pricing.ephemeral_storage_free_mb : 0) / 1024)) * $pricing.gb_second_storage %}",
+                "run_price_usd": "{% (($duration_ms_mean / 1000) * ($memory_mb / 1024)) * $lookup($pricing.gb_second_by_arch, $architecture) + (($duration_ms_mean / 1000) * (($ephemeral_storage_mb > $pricing.ephemeral_storage_free_mb ? $ephemeral_storage_mb - $pricing.ephemeral_storage_free_mb : 0) / 1024)) * $pricing.gb_second_storage %}"
               }
-            ],
+            },
+            "Next": "DeleteAllArchives"
+          },
+          "DeleteAllArchives": {
+            "Type": "Map",
+            "Comment": "Delete all per-run archives (best-effort — catch-all on each deletion).",
+            "Items": "{% $all_archive_keys %}",
+            "ItemSelector": {
+              "archive_key": "{% $states.context.Map.Item.Value %}"
+            },
+            "MaxConcurrency": 0,
+            "ItemProcessor": {
+              "ProcessorConfig": {
+                "Mode": "INLINE"
+              },
+              "StartAt": "DeleteOneArchive",
+              "States": {
+                "DeleteOneArchive": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+                  "Arguments": {
+                    "Bucket": "${BucketName}",
+                    "Key": "{% $states.input.archive_key %}"
+                  },
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"],
+                      "Next": "IgnoreDeleteError"
+                    }
+                  ],
+                  "Next": "IgnoreDeleteError"
+                },
+                "IgnoreDeleteError": {
+                  "Type": "Pass",
+                  "End": true
+                }
+              }
+            },
+            "Output": "{% $contender_result %}",
             "Next": "EndSuccess"
           },
           "EndSuccess": {
@@ -190,7 +292,7 @@
     "PartitionResults": {
       "Type": "Pass",
       "Output": {
-        "success": "{% ($res := $sort([$states.input[kind='success']], function($a, $b) { $a.run_price_usd > $b.run_price_usd }) ~> $map(function($v) { { 'arn': $v.arn, 'runtime': $v.runtime, 'architecture': $v.architecture, 'memory_mb': $v.memory_mb, 'ephemeral_storage_mb': $v.ephemeral_storage_mb, 'duration_ms': $v.duration_ms, 'gb_second_compute': $v.gb_second_compute, 'gb_second_storage': $v.gb_second_storage, 'compute_rate_usd': $v.compute_rate_usd, 'storage_rate_usd': $v.storage_rate_usd, 'compute_price_usd': $v.compute_price_usd, 'storage_price_usd': $v.storage_price_usd, 'run_price_usd': $v.run_price_usd } }); $boolean($res) ? [$res] : []) %}",
+        "success": "{% ($res := $sort([$states.input[kind='success']], function($a, $b) { $a.run_price_usd > $b.run_price_usd }) ~> $map(function($v) { { 'arn': $v.arn, 'runtime': $v.runtime, 'architecture': $v.architecture, 'memory_mb': $v.memory_mb, 'ephemeral_storage_mb': $v.ephemeral_storage_mb, 'runs_count': $v.runs_count, 'duration_ms': $v.duration_ms, 'duration_ms_stddev': $v.duration_ms_stddev, 'duration_ms_min': $v.duration_ms_min, 'duration_ms_max': $v.duration_ms_max, 'gb_second_compute': $v.gb_second_compute, 'gb_second_storage': $v.gb_second_storage, 'compute_rate_usd': $v.compute_rate_usd, 'storage_rate_usd': $v.storage_rate_usd, 'compute_price_usd': $v.compute_price_usd, 'storage_price_usd': $v.storage_price_usd, 'run_price_usd': $v.run_price_usd } }); $boolean($res) ? [$res] : []) %}",
         "failure": "{% ($res := [$states.input[kind='failure']] ~> $map(function($v) { { 'arn': $v.arn, 'reason': $v.reason } }); $boolean($res) ? [$res] : []) %}"
       },
       "End": true

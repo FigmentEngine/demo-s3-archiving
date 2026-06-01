@@ -45,14 +45,21 @@ random body sized from `N(5 MB, 1 MB)` clamped to `[2 MB, 8 MB]`, and its
 S3 key is the SHA256 hex of its content.
 
 A Step Function takes a list of contender Lambda ARNs as input and, for each
-one in parallel (up to 10 concurrent):
+one in parallel:
 
-1. Derives the per-contender archive key from the function name.
-2. Invokes the contender Lambda with `{ "bucket_name": "...", "files_prefix": "files", "archive_key": "archives/<lang>-<dev_id>.zip" }`, timing the call.
-3. Invokes the internal `control` Lambda, which streams the produced ZIP back
-   from S3 and validates it (flat layout, one entry per source object, entry
-   name equals SHA256 of decompressed content).
-4. Deletes the archive.
+1. Derives the per-contender archive key base from the function name.
+2. Invokes the contender Lambda `RunsPerContender` times (default 10) **in parallel**,
+   each run writing to its own distinct key (`archives/<lang>-<dev_id>-<runIndex>.zip`),
+   timing each invocation independently.
+3. If any run fails (crash or timeout), the contender is reported as failed.
+4. Otherwise invokes the internal `control` Lambda on **run-0's archive**, which
+   streams the produced ZIP back from S3 and validates it (flat layout, one entry
+   per source object, entry name equals SHA256 of decompressed content).
+5. Deletes all per-run archives.
+
+The reported `duration_ms` is the **mean** across the `RunsPerContender` runs.
+`duration_ms_stddev`, `duration_ms_min`, and `duration_ms_max` capture the
+variability. All pricing fields are derived from the mean duration.
 
 The execution output is a single JSON document with two lists:
 
@@ -65,7 +72,11 @@ The execution output is a single JSON document with two lists:
       "architecture": "arm64",
       "memory_mb": 512,
       "ephemeral_storage_mb": 512,
+      "runs_count": 10,
       "duration_ms": 212631,
+      "duration_ms_stddev": 3241,
+      "duration_ms_min": 207834,
+      "duration_ms_max": 219102,
       "gb_second_compute": 106.3155,
       "gb_second_storage": 0,
       "compute_rate_usd": 0.0000133334,
@@ -87,7 +98,8 @@ accounting for architecture (arm64 vs x86_64) and ephemeral storage above the
 of [`templates/benching.asl.json`](templates/benching.asl.json).
 
 The number and average size of test objects (`TestFileCount`, `TestFileSize`)
-are CloudFormation parameters of the `benching` stack — override them on stack
+and the number of parallel runs per contender (`RunsPerContender`) are
+CloudFormation parameters of the `benching` stack — override them on stack
 update if you want to play with the harness, but please don't include that in
 your PRs.
 
