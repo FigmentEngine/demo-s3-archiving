@@ -392,9 +392,12 @@ cache:
     - rust_target_md5sum/**/* # Where we store md5sum for code
     - previous_dependencies_tree # The last seen dependencies tree
     - previous_build_rust_version # The last seen Rust toolchain version
-    # Per-contender SwiftPM caches: package checkouts + compile artifacts.
-    # Keyed under the contender directory so each Swift contender keeps
-    # its own .build state. Saves ~10 min on warm rebuilds.
-    - contenders/swift/*/.build/**/*
-    # Swift toolchain tarball cache (~85 MB, saves ~30 s download).
-    - .swift-cache/**/*
+
+
+    # NOTE: Disabled because as of now Swift do not take advantage of the cache and just bloats it.
+    # # Per-contender SwiftPM caches: package checkouts + compile artifacts.
+    # # Keyed under the contender directory so each Swift contender keeps
+    # # its own .build state. Saves ~10 min on warm rebuilds.
+    # - contenders/swift/*/.build/**/*
+    # # Swift toolchain tarball cache (~85 MB, saves ~30 s download).
+    # - .swift-cache/**/*
