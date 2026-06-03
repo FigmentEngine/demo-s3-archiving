@@ -941,6 +941,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "figment-engine"
+version = "0.1.0"
+dependencies = [
+ "aws-sdk-s3",
+ "awssdk-instrumentation",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "zip",
+]
+
+[[package]]
 name = "fill-bucket"
 version = "0.1.0"
 dependencies = [
