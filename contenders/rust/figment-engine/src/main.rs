@@ -22,6 +22,7 @@ use aws_sdk_s3::{
 };
 
 use awssdk_instrumentation::lambda::{LambdaError, LambdaEvent};
+//use awssdk_instrumentation::lambda::{LambdaError, LambdaEvent};
 use serde::Deserialize;
 use slabs_buffer::SlabBuf;
 use slabs_buffer::{Reader, Writer};
@@ -29,7 +30,7 @@ use tokio::{
 	sync::{OwnedSemaphorePermit, Semaphore, mpsc},
 	task::JoinSet,
 };
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info};
 
 // ---------- Tunables ----------
 
@@ -44,21 +45,21 @@ const CHUNK_SIZE_BYTES: usize = 10 * 1024 * 1024;
 const BUFFER_CHUNKS_COUNT: usize = MAX_CONCURRENT_UPLOADS * 2; // always ensure free slabs retained during uploads
 
 /// Info switch every 50
-const TRACING_INFO_FREQUENCY: usize = 50;
+//const TRACING_INFO_FREQUENCY: usize = 50;
 
 // ---------- Helpers ----------
 
 /// Emits an `INFO` event every [`TRACING_INFO_FREQUENCY`] calls and `DEBUG` otherwise,
 /// keeping hot-path logs quiet without losing periodic visibility.
-macro_rules! intermitent_tracing {
-    ($index:ident, $($tt:tt)+) => {
-        if $index as usize % TRACING_INFO_FREQUENCY == 0 {
-            tracing::event!(tracing::Level::INFO, $($tt)+);
-        } else {
-            tracing::event!(tracing::Level::DEBUG, $($tt)+);
-        }
-    };
-}
+// macro_rules! intermitent_tracing {
+//     ($index:ident, $($tt:tt)+) => {
+//         if $index as usize % TRACING_INFO_FREQUENCY == 0 {
+//             tracing::event!(tracing::Level::INFO, $($tt)+);
+//         } else {
+//             tracing::event!(tracing::Level::DEBUG, $($tt)+);
+//         }
+//     };
+// }
 
 /// Crate-wide error type. The blanket `From<SdkError<E, R>>` impl below funnels all
 /// typed AWS SDK operation errors into the [`Error::S3`] variant via `aws_sdk_s3::Error`.
@@ -125,7 +126,7 @@ struct JobInfo {
 ///
 /// Streams chunks manually instead of using `response.body.collect()` to avoid the ~3× memory
 /// amplification caused by that helper's internal intermediate buffers.
-#[instrument(err)]
+//#[instrument(err)]
 async fn download_file(
 	bucket: String,
 	key: String,
@@ -154,7 +155,7 @@ async fn download_file(
 /// A `Semaphore` of `MAX_DOWNLOADS_MEMORY` permits bounds total in-flight download memory;
 /// each task acquires `file.size` permits before starting and releases them when the zipper
 /// drops the permit after consuming the data.
-#[instrument(skip_all)]
+//#[instrument(skip_all)]
 fn spawn_download_job(
 	job_info: JobInfo,
 	files: Vec<FileInfo>,
@@ -165,7 +166,7 @@ fn spawn_download_job(
 
 		let JobInfo { bucket_name, .. } = job_info;
 
-		for (task_index, file_info) in files.into_iter().enumerate() {
+		for (_task_index, file_info) in files.into_iter().enumerate() {
 			let FileInfo { name, key, size } = file_info;
 
 			debug!(
@@ -187,11 +188,11 @@ fn spawn_download_job(
 				debug!("Download job for {name} started");
 				let data = download_file(bucket_name, key, size).await?;
 
-				intermitent_tracing!(
-					task_index,
-					"data.len()" = data.len(),
-					"Downloaded file {name}"
-				);
+				// intermitent_tracing!(
+				// 	task_index,
+				// 	"data.len()" = data.len(),
+				// 	"Downloaded file {name}"
+				// );
 
 				Ok::<_, Error>(
 					tx.send((name, data, memory_permits))
@@ -207,7 +208,7 @@ fn spawn_download_job(
 /// Receives `(filename, data, permit)` tuples from the downloader, writes each file into a
 /// [`zipper::Zipper`], then finalizes and flushes the ZIP — which seals the last slab so the
 /// uploader sees the trailing bytes.
-#[instrument(skip_all)]
+//#[instrument(skip_all)]
 fn spawn_zip_job(
 	mut zip_queue_rx: mpsc::UnboundedReceiver<(String, Vec<u8>, OwnedSemaphorePermit)>,
 	ring_buffer_writer: Writer,
@@ -224,12 +225,12 @@ fn spawn_zip_job(
 				processed_files += 1;
 				let (filename, data, _permit) = photo_result;
 
-				intermitent_tracing!(
-					processed_files,
-					"Adding {} to ZIP archive ({} bytes)",
-					filename,
-					data.len()
-				);
+				// intermitent_tracing!(
+				// 	processed_files,
+				// 	"Adding {} to ZIP archive ({} bytes)",
+				// 	filename,
+				// 	data.len()
+				// );
 				if let Err(error) = zipper.add_file(filename, data) {
 					error!(error, "Failed to create ZIP");
 					return;
@@ -264,7 +265,7 @@ fn spawn_zip_job(
 ///
 /// Up to `MAX_CONCURRENT_UPLOADS` parts are in-flight simultaneously via a `Semaphore`.
 /// Returns the collected [`CompletedPart`] list needed to finalize the multipart upload.
-#[instrument(skip_all)]
+//#[instrument(skip_all)]
 fn spawn_upload_jobs(
 	mut reader: Reader,
 	multipart_upload: MultipartUpload,
@@ -290,11 +291,11 @@ fn spawn_upload_jobs(
 				let _permit = semaphore.acquire().await.unwrap();
 				match upload_part(multipart_upload, part_number, lease.into_bytes()).await {
 					Ok(completed_part) => {
-						intermitent_tracing!(
-							part_number,
-							part_number,
-							"Successfully uploaded part"
-						);
+						// intermitent_tracing!(
+						// 	part_number,
+						// 	part_number,
+						// 	"Successfully uploaded part"
+						// );
 						Ok(completed_part)
 					}
 					Err(e) => {
@@ -327,7 +328,7 @@ struct MultipartUpload {
 }
 
 /// Initiates an S3 multipart upload for the archive key and returns the resulting [`MultipartUpload`].
-#[instrument]
+//#[instrument]
 async fn start_multipart_upload(job_info: JobInfo) -> Result<MultipartUpload, Error> {
 	let JobInfo {
 		bucket_name,
@@ -359,7 +360,7 @@ async fn start_multipart_upload(job_info: JobInfo) -> Result<MultipartUpload, Er
 }
 
 /// Uploads one part of a multipart upload and returns the [`CompletedPart`] with its ETag.
-#[instrument(skip(data))]
+//#[instrument(skip(data))]
 async fn upload_part(
 	multipart_upload: MultipartUpload,
 	part_number: i32,
@@ -388,7 +389,7 @@ async fn upload_part(
 }
 
 /// Sorts parts by part number and finalizes the multipart upload.
-#[instrument(skip(completed_parts))]
+//#[instrument(skip(completed_parts))]
 async fn complete_multipart_upload(
 	multipart_upload: MultipartUpload,
 	mut completed_parts: Vec<CompletedPart>,
@@ -420,7 +421,7 @@ async fn complete_multipart_upload(
 ///
 /// Starts the multipart upload, wires the three pipeline stages together via channels and a
 /// [`SlabRing`], awaits each stage in order, then completes the multipart upload.
-#[instrument(skip(files))]
+//#[instrument(skip(files))]
 async fn create_multipart_archive(files: Vec<FileInfo>, job_info: JobInfo) -> Result<(), Error> {
 	info!("files.len()" = files.len(), "Creating multipart archive");
 
@@ -471,7 +472,7 @@ async fn create_multipart_archive(files: Vec<FileInfo>, job_info: JobInfo) -> Re
 /// Lists all objects under `{key_prefix}/` using the SDK paginator and returns one [`FileInfo`] per object.
 ///
 /// Strips the prefix from each key to obtain the bare filename used as the ZIP entry name.
-#[instrument]
+//#[instrument]
 async fn list_files(bucket: String, key_prefix: &str) -> Result<Vec<FileInfo>, Error> {
 	info!("Listing files");
 
@@ -518,7 +519,7 @@ async fn list_files(bucket: String, key_prefix: &str) -> Result<Vec<FileInfo>, E
 }
 
 /// Lambda handler: lists source files then delegates to [`create_multipart_archive`].
-#[instrument(skip_all, fields(job_info = ?event.payload))]
+//#[instrument(skip_all, fields(job_info = ?event.payload))]
 async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
 	info!("Start processing");
 
