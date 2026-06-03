@@ -17,16 +17,16 @@ mod zipper;
 use std::{io::Write, sync::Arc};
 
 use aws_sdk_s3::{
-    primitives::ByteStream,
-    types::{CompletedMultipartUpload, CompletedPart},
+	primitives::ByteStream,
+	types::{CompletedMultipartUpload, CompletedPart},
 };
 
 use awssdk_instrumentation::lambda::{LambdaError, LambdaEvent};
 use serde::Deserialize;
 use slabs_ring::{Reader, SlabRing, Writer};
 use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
-    task::JoinSet,
+	sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+	task::JoinSet,
 };
 use tracing::{debug, error, info, instrument};
 
@@ -40,7 +40,7 @@ const MAX_CONCURRENT_UPLOADS: usize = 3;
 /// Size of each multipart upload chunk (10MB)
 const CHUNK_SIZE_BYTES: usize = 10 * 1024 * 1024;
 /// Slab Ring Buffer size in chuncks
-const BUFFER_CHUNKS_COUNT: usize = 2;
+const BUFFER_CHUNKS_COUNT: usize = 3; // we don't want to starve with slabs retained during uploads
 
 /// Info switch every 50
 const TRACING_INFO_FREQUENCY: usize = 50;
@@ -63,44 +63,44 @@ macro_rules! intermitent_tracing {
 /// typed AWS SDK operation errors into the [`Error::S3`] variant via `aws_sdk_s3::Error`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
-    #[error("s3 error: {0}")]
-    S3(#[from] aws_sdk_s3::Error),
-    #[error("s3 bytestream error: {0}")]
-    S3ByteStream(#[from] aws_sdk_s3::primitives::ByteStreamError),
-    #[error(transparent)]
-    Zip(#[from] zip::result::ZipError),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error("Task panicked: {0}")]
-    Join(#[from] tokio::task::JoinError),
-    #[error("{0}")]
-    Custom(String),
+	#[error("s3 error: {0}")]
+	S3(#[from] aws_sdk_s3::Error),
+	#[error("s3 bytestream error: {0}")]
+	S3ByteStream(#[from] aws_sdk_s3::primitives::ByteStreamError),
+	#[error(transparent)]
+	Zip(#[from] zip::result::ZipError),
+	#[error(transparent)]
+	Io(#[from] std::io::Error),
+	#[error("Task panicked: {0}")]
+	Join(#[from] tokio::task::JoinError),
+	#[error("{0}")]
+	Custom(String),
 }
 impl<E, R> From<aws_sdk_s3::error::SdkError<E, R>> for Error
 where
-    aws_sdk_s3::error::SdkError<E, R>: Into<aws_sdk_s3::Error>,
+	aws_sdk_s3::error::SdkError<E, R>: Into<aws_sdk_s3::Error>,
 {
-    fn from(err: aws_sdk_s3::error::SdkError<E, R>) -> Self {
-        Error::S3(err.into())
-    }
+	fn from(err: aws_sdk_s3::error::SdkError<E, R>) -> Self {
+		Error::S3(err.into())
+	}
 }
 impl From<&str> for Error {
-    fn from(err: &str) -> Self {
-        Error::Custom(err.to_owned())
-    }
+	fn from(err: &str) -> Self {
+		Error::Custom(err.to_owned())
+	}
 }
 impl From<String> for Error {
-    fn from(err: String) -> Self {
-        Error::Custom(err)
-    }
+	fn from(err: String) -> Self {
+		Error::Custom(err)
+	}
 }
 
 /// One source S3 object to be archived: its bare filename (ZIP entry name), full S3 key, and byte size.
 #[derive(Debug)]
 struct FileInfo {
-    name: String,
-    key: String,
-    size: usize,
+	name: String,
+	key: String,
+	size: usize,
 }
 
 // ---------- Event ----------
@@ -113,9 +113,9 @@ struct FileInfo {
 /// - `archive_key` — destination S3 key for the produced ZIP (e.g. `archives/rust-jeremie-rodon.zip`).
 #[derive(Debug, Deserialize, Clone)]
 struct JobInfo {
-    bucket_name: Arc<str>,
-    files_prefix: Arc<str>,
-    archive_key: Arc<str>,
+	bucket_name: Arc<str>,
+	files_prefix: Arc<str>,
+	archive_key: Arc<str>,
 }
 
 // ---------- Main logic ----------
@@ -126,26 +126,26 @@ struct JobInfo {
 /// amplification caused by that helper's internal intermediate buffers.
 #[instrument(err)]
 async fn download_file(
-    bucket: String,
-    key: String,
-    expected_size: usize,
+	bucket: String,
+	key: String,
+	expected_size: usize,
 ) -> Result<Vec<u8>, Error> {
-    debug!("Downloading file");
+	debug!("Downloading file");
 
-    let mut response = s3().get_object().bucket(bucket).key(key).send().await?;
+	let mut response = s3().get_object().bucket(bucket).key(key).send().await?;
 
-    // I DO NOT use the `response.body.collect()` helper here because it allocates
-    // internally a lot of intermediate buffers that amplify the memory footprint
-    // of the download process x3 (a 50MB photo download results in ~150MB of memory consumption).
-    // Instead, I'm manually collecting chunks and adding them in a pre-allocated data vec,
-    // resulting in a minimal overhead per-download task of the S3 chunk_size (16KB from my tests).
-    let mut data = Vec::with_capacity(expected_size);
-    while let Some(chunk_result) = response.body.next().await {
-        let chunk = chunk_result?;
-        data.extend_from_slice(&chunk);
-    }
+	// I DO NOT use the `response.body.collect()` helper here because it allocates
+	// internally a lot of intermediate buffers that amplify the memory footprint
+	// of the download process x3 (a 50MB photo download results in ~150MB of memory consumption).
+	// Instead, I'm manually collecting chunks and adding them in a pre-allocated data vec,
+	// resulting in a minimal overhead per-download task of the S3 chunk_size (16KB from my tests).
+	let mut data = Vec::with_capacity(expected_size);
+	while let Some(chunk_result) = response.body.next().await {
+		let chunk = chunk_result?;
+		data.extend_from_slice(&chunk);
+	}
 
-    Ok(data)
+	Ok(data)
 }
 
 /// Spawns one tokio task per file that downloads it and sends `(name, data, permit)` to the zipper.
@@ -155,50 +155,50 @@ async fn download_file(
 /// drops the permit after consuming the data.
 #[instrument(skip_all)]
 fn spawn_download_job(
-    job_info: JobInfo,
-    files: Vec<FileInfo>,
-    zip_queue_tx: mpsc::UnboundedSender<(String, Vec<u8>, OwnedSemaphorePermit)>,
+	job_info: JobInfo,
+	files: Vec<FileInfo>,
+	zip_queue_tx: mpsc::UnboundedSender<(String, Vec<u8>, OwnedSemaphorePermit)>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let memory_semaphore = Arc::new(Semaphore::new(MAX_DOWNLOADS_MEMORY));
+	tokio::spawn(async move {
+		let memory_semaphore = Arc::new(Semaphore::new(MAX_DOWNLOADS_MEMORY));
 
-        let JobInfo { bucket_name, .. } = job_info;
+		let JobInfo { bucket_name, .. } = job_info;
 
-        for (task_index, file_info) in files.into_iter().enumerate() {
-            let FileInfo { name, key, size } = file_info;
+		for (task_index, file_info) in files.into_iter().enumerate() {
+			let FileInfo { name, key, size } = file_info;
 
-            debug!(
-                size,
-                "Download memory space: {}/{MAX_DOWNLOADS_MEMORY}",
-                memory_semaphore.available_permits()
-            );
-            let memory_permits = memory_semaphore
-                .clone()
-                .acquire_many_owned(size as u32)
-                .await
-                .unwrap();
+			debug!(
+				size,
+				"Download memory space: {}/{MAX_DOWNLOADS_MEMORY}",
+				memory_semaphore.available_permits()
+			);
+			let memory_permits = memory_semaphore
+				.clone()
+				.acquire_many_owned(size as u32)
+				.await
+				.unwrap();
 
-            let tx = zip_queue_tx.clone();
+			let tx = zip_queue_tx.clone();
 
-            let bucket_name = (*bucket_name).to_owned();
+			let bucket_name = (*bucket_name).to_owned();
 
-            tokio::spawn(async move {
-                debug!("Download job for {name} started");
-                let data = download_file(bucket_name, key, size).await?;
+			tokio::spawn(async move {
+				debug!("Download job for {name} started");
+				let data = download_file(bucket_name, key, size).await?;
 
-                intermitent_tracing!(
-                    task_index,
-                    "data.len()" = data.len(),
-                    "Downloaded file {name}"
-                );
+				intermitent_tracing!(
+					task_index,
+					"data.len()" = data.len(),
+					"Downloaded file {name}"
+				);
 
-                Ok::<_, Error>(
-                    tx.send((name, data, memory_permits))
-                        .map_err(|e| e.to_string())?,
-                )
-            });
-        }
-    })
+				Ok::<_, Error>(
+					tx.send((name, data, memory_permits))
+						.map_err(|e| e.to_string())?,
+				)
+			});
+		}
+	})
 }
 
 /// Spawns the ZIP creation job in `spawn_blocking` (required because [`Writer`] may busy-spin).
@@ -208,55 +208,55 @@ fn spawn_download_job(
 /// uploader sees the trailing bytes.
 #[instrument(skip_all)]
 fn spawn_zip_job(
-    mut zip_queue_rx: mpsc::UnboundedReceiver<(String, Vec<u8>, OwnedSemaphorePermit)>,
-    ring_buffer_writer: Writer,
+	mut zip_queue_rx: mpsc::UnboundedReceiver<(String, Vec<u8>, OwnedSemaphorePermit)>,
+	ring_buffer_writer: Writer,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        tokio::task::spawn_blocking(move || {
-            let mut zipper = zipper::Zipper::new(ring_buffer_writer);
-            let mut processed_files = 0;
+	tokio::spawn(async move {
+		tokio::task::spawn_blocking(move || {
+			let mut zipper = zipper::Zipper::new(ring_buffer_writer);
+			let mut processed_files = 0;
 
-            info!("ZIP creation job started");
+			info!("ZIP creation job started");
 
-            while let Some(photo_result) = zip_queue_rx.blocking_recv() {
-                debug!("zip_queue.len(): {}", zip_queue_rx.len());
-                processed_files += 1;
-                let (filename, data, _permit) = photo_result;
+			while let Some(photo_result) = zip_queue_rx.blocking_recv() {
+				debug!("zip_queue.len(): {}", zip_queue_rx.len());
+				processed_files += 1;
+				let (filename, data, _permit) = photo_result;
 
-                intermitent_tracing!(
-                    processed_files,
-                    "Adding {} to ZIP archive ({} bytes)",
-                    filename,
-                    data.len()
-                );
-                if let Err(error) = zipper.add_file(filename, data) {
-                    error!(error, "Failed to create ZIP");
-                    return;
-                }
-                debug!("Processed {} files", processed_files);
-            }
+				intermitent_tracing!(
+					processed_files,
+					"Adding {} to ZIP archive ({} bytes)",
+					filename,
+					data.len()
+				);
+				if let Err(error) = zipper.add_file(filename, data) {
+					error!(error, "Failed to create ZIP");
+					return;
+				}
+				debug!("Processed {} files", processed_files);
+			}
 
-            info!(processed_files, "Finalizing ZIP archive");
+			info!(processed_files, "Finalizing ZIP archive");
 
-            // Finalize ZIP
-            match zipper.finish() {
-                Ok(mut w) => {
-                    if let Err(e) = w.flush() {
-                        error!("Failed to flush ZIP buffer: {}", e);
-                        return;
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to finalize ZIP: {}", e);
-                    return;
-                }
-            }
+			// Finalize ZIP
+			match zipper.finish() {
+				Ok(mut w) => {
+					if let Err(e) = w.flush() {
+						error!("Failed to flush ZIP buffer: {}", e);
+						return;
+					}
+				}
+				Err(e) => {
+					error!("Failed to finalize ZIP: {}", e);
+					return;
+				}
+			}
 
-            info!("ZIP creation job completed");
-        })
-        .await
-        .unwrap()
-    })
+			info!("ZIP creation job completed");
+		})
+		.await
+		.unwrap()
+	})
 }
 
 /// Reads sealed [`SlabLease`]s from the ring buffer and uploads each as a multipart part.
@@ -265,155 +265,155 @@ fn spawn_zip_job(
 /// Returns the collected [`CompletedPart`] list needed to finalize the multipart upload.
 #[instrument(skip_all)]
 fn spawn_upload_jobs(
-    mut reader: Reader,
-    multipart_upload: MultipartUpload,
+	mut reader: Reader,
+	multipart_upload: MultipartUpload,
 ) -> tokio::task::JoinHandle<Result<Vec<CompletedPart>, Error>> {
-    tokio::spawn(async move {
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS));
+	tokio::spawn(async move {
+		let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS));
 
-        let mut part_number = 1i32;
-        let mut job_handles = JoinSet::new();
+		let mut part_number = 1i32;
+		let mut job_handles = JoinSet::new();
 
-        info!("Upload job started");
+		info!("Upload job started");
 
-        while let Some(lease) = reader.recv().await {
-            debug!("Upload job: Received slab #{part_number}");
-            debug!(
-                "Upload jobs slot: {}/{MAX_CONCURRENT_UPLOADS}",
-                semaphore.available_permits()
-            );
-            let semaphore = semaphore.clone();
-            let multipart_upload = multipart_upload.clone();
+		while let Some(lease) = reader.recv().await {
+			debug!("Upload job: Received slab #{part_number}");
+			debug!(
+				"Upload jobs slot: {}/{MAX_CONCURRENT_UPLOADS}",
+				semaphore.available_permits()
+			);
+			let semaphore = semaphore.clone();
+			let multipart_upload = multipart_upload.clone();
 
-            job_handles.spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
-                match upload_part(multipart_upload, part_number, lease.into_vec()).await {
-                    Ok(completed_part) => {
-                        intermitent_tracing!(
-                            part_number,
-                            part_number,
-                            "Successfully uploaded part"
-                        );
-                        Ok(completed_part)
-                    }
-                    Err(e) => {
-                        error!("Failed to upload part {}: {}", part_number, e);
-                        return Err(e);
-                    }
-                }
-            });
+			job_handles.spawn(async move {
+				let _permit = semaphore.acquire().await.unwrap();
+				match upload_part(multipart_upload, part_number, lease.into_bytes()).await {
+					Ok(completed_part) => {
+						intermitent_tracing!(
+							part_number,
+							part_number,
+							"Successfully uploaded part"
+						);
+						Ok(completed_part)
+					}
+					Err(e) => {
+						error!("Failed to upload part {}: {}", part_number, e);
+						return Err(e);
+					}
+				}
+			});
 
-            part_number += 1;
-        }
+			part_number += 1;
+		}
 
-        let job_results = job_handles.join_all().await;
-        let all_completed_parts = job_results.into_iter().collect::<Result<Vec<_>, _>>()?;
+		let job_results = job_handles.join_all().await;
+		let all_completed_parts = job_results.into_iter().collect::<Result<Vec<_>, _>>()?;
 
-        info!(
-            "Upload job completed with {} parts",
-            all_completed_parts.len()
-        );
-        Ok(all_completed_parts)
-    })
+		info!(
+			"Upload job completed with {} parts",
+			all_completed_parts.len()
+		);
+		Ok(all_completed_parts)
+	})
 }
 
 /// Bundles the bucket, key, and upload ID needed to reference an in-progress multipart upload.
 #[derive(Debug, Clone)]
 struct MultipartUpload {
-    bucket: Arc<str>,
-    key: Arc<str>,
-    upload_id: Arc<str>,
+	bucket: Arc<str>,
+	key: Arc<str>,
+	upload_id: Arc<str>,
 }
 
 /// Initiates an S3 multipart upload for the archive key and returns the resulting [`MultipartUpload`].
 #[instrument]
 async fn start_multipart_upload(job_info: JobInfo) -> Result<MultipartUpload, Error> {
-    let JobInfo {
-        bucket_name,
-        archive_key,
-        ..
-    } = job_info;
+	let JobInfo {
+		bucket_name,
+		archive_key,
+		..
+	} = job_info;
 
-    info!("Starting multipart upload");
+	info!("Starting multipart upload");
 
-    let response = s3()
-        .create_multipart_upload()
-        .bucket(&*bucket_name)
-        .key(&*archive_key)
-        .content_type("application/zip")
-        .send()
-        .await?;
+	let response = s3()
+		.create_multipart_upload()
+		.bucket(&*bucket_name)
+		.key(&*archive_key)
+		.content_type("application/zip")
+		.send()
+		.await?;
 
-    let upload_id = response
-        .upload_id
-        .ok_or("No upload ID in multipart upload response")?;
+	let upload_id = response
+		.upload_id
+		.ok_or("No upload ID in multipart upload response")?;
 
-    info!(upload_id, "Multipart upload started");
+	info!(upload_id, "Multipart upload started");
 
-    Ok(MultipartUpload {
-        bucket: bucket_name,
-        key: archive_key,
-        upload_id: Arc::from(upload_id),
-    })
+	Ok(MultipartUpload {
+		bucket: bucket_name,
+		key: archive_key,
+		upload_id: Arc::from(upload_id),
+	})
 }
 
 /// Uploads one part of a multipart upload and returns the [`CompletedPart`] with its ETag.
 #[instrument(skip(data))]
 async fn upload_part(
-    multipart_upload: MultipartUpload,
-    part_number: i32,
-    data: Vec<u8>,
+	multipart_upload: MultipartUpload,
+	part_number: i32,
+	data: bytes::Bytes,
 ) -> Result<CompletedPart, Error> {
-    debug!("data.len()" = data.len(), "Uploading part");
+	debug!("data.len()" = data.len(), "Uploading part");
 
-    let response = s3()
-        .upload_part()
-        .bucket(multipart_upload.bucket.as_ref())
-        .key(multipart_upload.key.as_ref())
-        .upload_id(multipart_upload.upload_id.as_ref())
-        .part_number(part_number)
-        .body(ByteStream::from(data))
-        .send()
-        .await?;
+	let response = s3()
+		.upload_part()
+		.bucket(multipart_upload.bucket.as_ref())
+		.key(multipart_upload.key.as_ref())
+		.upload_id(multipart_upload.upload_id.as_ref())
+		.part_number(part_number)
+		.body(ByteStream::from(data))
+		.send()
+		.await?;
 
-    let etag = response.e_tag.ok_or("No ETag in upload part response")?;
+	let etag = response.e_tag.ok_or("No ETag in upload part response")?;
 
-    debug!(part_number, etag, "Part uploaded");
+	debug!(part_number, etag, "Part uploaded");
 
-    Ok(CompletedPart::builder()
-        .part_number(part_number)
-        .e_tag(etag)
-        .build())
+	Ok(CompletedPart::builder()
+		.part_number(part_number)
+		.e_tag(etag)
+		.build())
 }
 
 /// Sorts parts by part number and finalizes the multipart upload.
 #[instrument(skip(completed_parts))]
 async fn complete_multipart_upload(
-    multipart_upload: MultipartUpload,
-    mut completed_parts: Vec<CompletedPart>,
+	multipart_upload: MultipartUpload,
+	mut completed_parts: Vec<CompletedPart>,
 ) -> Result<(), Error> {
-    // Sort parts by part number
-    completed_parts.sort_by_key(|part| part.part_number());
+	// Sort parts by part number
+	completed_parts.sort_by_key(|part| part.part_number());
 
-    info!(
-        "completed_parts.len()" = completed_parts.len(),
-        "Completing multipart upload"
-    );
+	info!(
+		"completed_parts.len()" = completed_parts.len(),
+		"Completing multipart upload"
+	);
 
-    let completed_upload = CompletedMultipartUpload::builder()
-        .set_parts(Some(completed_parts))
-        .build();
+	let completed_upload = CompletedMultipartUpload::builder()
+		.set_parts(Some(completed_parts))
+		.build();
 
-    s3().complete_multipart_upload()
-        .bucket(multipart_upload.bucket.as_ref())
-        .key(multipart_upload.key.as_ref())
-        .upload_id(multipart_upload.upload_id.as_ref())
-        .multipart_upload(completed_upload)
-        .send()
-        .await?;
+	s3().complete_multipart_upload()
+		.bucket(multipart_upload.bucket.as_ref())
+		.key(multipart_upload.key.as_ref())
+		.upload_id(multipart_upload.upload_id.as_ref())
+		.multipart_upload(completed_upload)
+		.send()
+		.await?;
 
-    info!("Multipart upload completed successfully");
-    Ok(())
+	info!("Multipart upload completed successfully");
+	Ok(())
 }
 /// Orchestrates the full download → zip → upload pipeline for a list of files.
 ///
@@ -421,50 +421,50 @@ async fn complete_multipart_upload(
 /// [`SlabRing`], awaits each stage in order, then completes the multipart upload.
 #[instrument(skip(files))]
 async fn create_multipart_archive(files: Vec<FileInfo>, job_info: JobInfo) -> Result<(), Error> {
-    info!("files.len()" = files.len(), "Creating multipart archive");
+	info!("files.len()" = files.len(), "Creating multipart archive");
 
-    // 1. Start multipart upload
-    let multipart_upload = start_multipart_upload(job_info.clone()).await?;
+	// 1. Start multipart upload
+	let multipart_upload = start_multipart_upload(job_info.clone()).await?;
 
-    // 2. Set up communication channels
-    let (zip_queue_tx, zip_queue_rx) = mpsc::unbounded_channel();
-    let (writer, reader) = SlabRing::new(CHUNK_SIZE_BYTES, BUFFER_CHUNKS_COUNT);
+	// 2. Set up communication channels
+	let (zip_queue_tx, zip_queue_rx) = mpsc::unbounded_channel();
+	let (writer, reader) = SlabRing::new(CHUNK_SIZE_BYTES, BUFFER_CHUNKS_COUNT);
 
-    // 3. Spawn all jobs
-    let download_handle = spawn_download_job(job_info, files, zip_queue_tx);
-    let zip_handle = spawn_zip_job(zip_queue_rx, writer);
-    let upload_handle = spawn_upload_jobs(reader, multipart_upload.clone());
+	// 3. Spawn all jobs
+	let download_handle = spawn_download_job(job_info, files, zip_queue_tx);
+	let zip_handle = spawn_zip_job(zip_queue_rx, writer);
+	let upload_handle = spawn_upload_jobs(reader, multipart_upload.clone());
 
-    // 4. Wait for all download jobs to complete
-    info!("Waiting for download jobs to complete");
-    if let Err(e) = download_handle.await {
-        error!("Download job failed: {}", e);
-    }
+	// 4. Wait for all download jobs to complete
+	info!("Waiting for download jobs to complete");
+	if let Err(e) = download_handle.await {
+		error!("Download job failed: {}", e);
+	}
 
-    // 5. Wait for ZIP creation to complete
-    info!("Waiting for ZIP creation to complete");
-    if let Err(error) = zip_handle.await {
-        error!(?error, "ZIP creation job failed");
-    }
+	// 5. Wait for ZIP creation to complete
+	info!("Waiting for ZIP creation to complete");
+	if let Err(error) = zip_handle.await {
+		error!(?error, "ZIP creation job failed");
+	}
 
-    // 6. Wait for ZIP parts upload to complete
-    info!("Waiting for ZIP parts upload to complete");
+	// 6. Wait for ZIP parts upload to complete
+	info!("Waiting for ZIP parts upload to complete");
 
-    let completed_parts = match upload_handle.await {
-        Ok(Ok(parts)) => parts,
-        Ok(Err(e)) => {
-            return Err(format!("Upload job failed: {}", e))?;
-        }
-        Err(e) => {
-            return Err(format!("Upload job panicked: {}", e))?;
-        }
-    };
+	let completed_parts = match upload_handle.await {
+		Ok(Ok(parts)) => parts,
+		Ok(Err(e)) => {
+			return Err(format!("Upload job failed: {}", e))?;
+		}
+		Err(e) => {
+			return Err(format!("Upload job panicked: {}", e))?;
+		}
+	};
 
-    // 7. Complete multipart upload
-    complete_multipart_upload(multipart_upload, completed_parts).await?;
+	// 7. Complete multipart upload
+	complete_multipart_upload(multipart_upload, completed_parts).await?;
 
-    info!("Multipart pack creation completed successfully");
-    Ok(())
+	info!("Multipart pack creation completed successfully");
+	Ok(())
 }
 
 /// Lists all objects under `{key_prefix}/` using the SDK paginator and returns one [`FileInfo`] per object.
@@ -472,71 +472,71 @@ async fn create_multipart_archive(files: Vec<FileInfo>, job_info: JobInfo) -> Re
 /// Strips the prefix from each key to obtain the bare filename used as the ZIP entry name.
 #[instrument]
 async fn list_files(bucket: String, key_prefix: &str) -> Result<Vec<FileInfo>, Error> {
-    info!("Listing files");
+	info!("Listing files");
 
-    // Ensure the prefix passed to S3 ends with `/` so we list only objects
-    // under the directory and can cleanly strip it to get the filename.
-    let s3_prefix = format!("{key_prefix}/");
+	// Ensure the prefix passed to S3 ends with `/` so we list only objects
+	// under the directory and can cleanly strip it to get the filename.
+	let s3_prefix = format!("{key_prefix}/");
 
-    let mut paginator = s3()
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(&s3_prefix)
-        .into_paginator()
-        .send();
+	let mut paginator = s3()
+		.list_objects_v2()
+		.bucket(bucket)
+		.prefix(&s3_prefix)
+		.into_paginator()
+		.send();
 
-    let mut file_infos = Vec::new();
+	let mut file_infos = Vec::new();
 
-    while let Some(page) = paginator.next().await {
-        for object in page?.contents.unwrap_or_default() {
-            let Some(key) = object.key else {
-                continue;
-            };
-            let Some(size) = object.size.map(|s| s as usize) else {
-                continue;
-            };
-            // Skip the prefix "directory marker" itself, if any.
-            if key == s3_prefix {
-                continue;
-            }
-            if let Some(filename) = key.strip_prefix(&s3_prefix) {
-                if filename.is_empty() {
-                    continue;
-                }
-                file_infos.push(FileInfo {
-                    name: filename.to_owned(),
-                    key,
-                    size,
-                });
-            }
-        }
-    }
+	while let Some(page) = paginator.next().await {
+		for object in page?.contents.unwrap_or_default() {
+			let Some(key) = object.key else {
+				continue;
+			};
+			let Some(size) = object.size.map(|s| s as usize) else {
+				continue;
+			};
+			// Skip the prefix "directory marker" itself, if any.
+			if key == s3_prefix {
+				continue;
+			}
+			if let Some(filename) = key.strip_prefix(&s3_prefix) {
+				if filename.is_empty() {
+					continue;
+				}
+				file_infos.push(FileInfo {
+					name: filename.to_owned(),
+					key,
+					size,
+				});
+			}
+		}
+	}
 
-    debug!("Listed {} files", file_infos.len());
-    Ok(file_infos)
+	debug!("Listed {} files", file_infos.len());
+	Ok(file_infos)
 }
 
 /// Lambda handler: lists source files then delegates to [`create_multipart_archive`].
 #[instrument(skip_all, fields(job_info = ?event.payload))]
 async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
-    info!("Start processing");
+	info!("Start processing");
 
-    let job_info = event.payload;
+	let job_info = event.payload;
 
-    let JobInfo {
-        bucket_name,
-        files_prefix,
-        ..
-    } = &job_info;
+	let JobInfo {
+		bucket_name,
+		files_prefix,
+		..
+	} = &job_info;
 
-    // 1. List the files from S3
-    let files = list_files((**bucket_name).to_owned(), files_prefix).await?;
-    info!("Creating archive with {} files", files.len());
+	// 1. List the files from S3
+	let files = list_files((**bucket_name).to_owned(), files_prefix).await?;
+	info!("Creating archive with {} files", files.len());
 
-    // 2. Launch archive creation
-    create_multipart_archive(files, job_info).await?;
+	// 2. Launch archive creation
+	create_multipart_archive(files, job_info).await?;
 
-    Ok(())
+	Ok(())
 }
 
 // This macro from `awssdk-instrumentation` generates the entire main() function:
@@ -549,7 +549,7 @@ async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
 //
 // See: https://docs.rs/awssdk-instrumentation/latest/awssdk_instrumentation/macro.make_lambda_runtime.html
 awssdk_instrumentation::make_lambda_runtime!(
-    handler,
-    trigger = awssdk_instrumentation::lambda::layer::OTelFaasTrigger::Other,
-    s3() -> aws_sdk_s3::Client
+	handler,
+	trigger = awssdk_instrumentation::lambda::layer::OTelFaasTrigger::Other,
+	s3() -> aws_sdk_s3::Client
 );
