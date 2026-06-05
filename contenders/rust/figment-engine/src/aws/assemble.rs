@@ -1,6 +1,10 @@
 //! ============================================================================
 //! STATUS — read before trusting this module.
 //!
+//! WRITTEN BUT NOT COMPILED HERE (no Rust toolchain in the authoring sandbox).
+//! The pure engine (zip_format, plan, crc) is compiled+tested on your box and green.
+//! This AWS layer needs `cargo build` + an integration run to confirm:
+//!
 //!   [ ] SDK method/field names match your pinned aws-sdk-s3 version. Used here:
 //!       create_multipart_upload().upload_id()
 //!       upload_part().body(ByteStream).part_number().e_tag()
@@ -10,7 +14,6 @@
 //!       head_object().checksum_mode(ChecksumMode::Enabled).checksum_crc32()
 //!       get_object().body.next()
 //!   [ ] `futures` crate is available (FuturesUnordered, StreamExt). Add if needed.
-//!   [ ] crc32fast is a PRODUCT dependency (used at runtime for streamed-file CRCs).
 //!
 //! KNOWN FIRST-CUT SIMPLIFICATION (correct, not yet maximally fast):
 //!   Within a single chain, parts run sequentially (copy then stream), not concurrently.
@@ -86,7 +89,7 @@ pub async fn assemble(
 ) -> Result<(), AssembleError> {
 	// ---- Phase 1: fetch CRCs for copyable entries (HEAD + checksum-mode), await all ----
 	// Streamable entries' CRCs are computed from their bodies during streaming.
-	fill_copyable_crcs(s3, bucket, files_prefix, &mut plan).await?;
+	fill_crcs(s3, bucket, files_prefix, &mut plan).await?;
 	let plan = Arc::new(plan);
 
 	// ---- Open the final-merge (archive) MPU up front so copies can flow in as-you-go ----
@@ -304,11 +307,9 @@ async fn build_stream_part_bytes(
 				let entry = &plan.entries[id];
 				let key = format!("{files_prefix}/{}", entry.name);
 				let body = get_object_bytes(s3, bucket, &key, entry.size as usize).await?;
-				let crc = {
-					let mut h = crc32fast::Hasher::new();
-					h.update(&body);
-					h.finalize()
-				};
+				let crc = entry
+					.crc
+					.ok_or_else(|| AssembleError::BadCrc(entry.name.clone()))?;
 				let meta = entry_meta(entry, crc);
 				buf.extend_from_slice(&zip_format::local_header(&meta));
 				buf.extend_from_slice(&body);
@@ -361,21 +362,22 @@ fn entry_meta(e: &Entry, crc: u32) -> EntryMeta {
 	}
 }
 
-async fn fill_copyable_crcs(
+async fn fill_crcs(
 	s3: &Client,
 	bucket: &str,
 	files_prefix: &str,
 	plan: &mut Plan,
 ) -> Result<(), AssembleError> {
-	// Resolve (name) for each copyable id first, then fetch CRCs with bounded concurrency.
+	// HEAD every entry to fetch its stored full-object CRC32. All objects carry one, so
+	// this populates both copied (header rides a stream part) and streamed entries up front.
 	let jobs: Vec<(FileId, String)> = plan
-		.copyable
+		.order
 		.iter()
 		.map(|id| {
 			let name = plan
 				.entries
 				.get(id)
-				.expect("copyable id in entries")
+				.expect("ordered id in entries")
 				.name
 				.clone();
 			(*id, format!("{files_prefix}/{}", name))

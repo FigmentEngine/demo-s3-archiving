@@ -471,4 +471,191 @@ mod tests {
 			assert_eq!(&sha256_hex(&buf), n, "content hash == name");
 		}
 	}
+
+	// ===================================================================================
+	// PRODUCTION-LAYOUT ANCHOR — assemble the way assemble.rs does, then validate.
+	//
+	// The earlier test assembles bytes in canonical ENTRY order. Production instead builds
+	// each CHAIN as its own object (concatenating its PartSpec parts) and then concatenates
+	// the chain objects in final_merge_part_number order, finally appending the directory.
+	// The central directory's offsets are computed from plan.order. THIS TEST PROVES the two
+	// layouts produce identical bytes — i.e. concatenating chain objects in merge order
+	// reproduces the entry-order byte sequence the directory's offsets assume. If they ever
+	// diverge, the archive is invalid even though every other test passes.
+	//
+	// Pure: a synthetic in-memory store maps FileId -> content. No AWS.
+	// Run with: cargo test -p figment-engine --features zip_validate chain_layout_matches
+	// ===================================================================================
+	#[cfg(feature = "zip_validate")]
+	#[test]
+	fn chain_layout_matches_directory_offsets() {
+		use crate::engine::zip_format::{self, EntryMeta};
+		use sha2::{Digest, Sha256};
+		use std::collections::HashSet;
+		use std::io::{Cursor, Read};
+
+		fn sha256_hex(b: &[u8]) -> String {
+			let mut h = Sha256::new();
+			h.update(b);
+			let d = h.finalize();
+			let mut s = String::with_capacity(64);
+			for x in d {
+				use core::fmt::Write;
+				let _ = write!(s, "{:02x}", x);
+			}
+			s
+		}
+		fn crc32(b: &[u8]) -> u32 {
+			let mut h = crc32fast::Hasher::new();
+			h.update(b);
+			h.finalize()
+		}
+
+		// ---- synthetic store: id -> content; name = sha256(content) ----
+		let big = PART_FLOOR as usize + 77;
+		let raw: Vec<Vec<u8>> = vec![
+			vec![1u8; big],   // 0 copyable
+			vec![2u8; 1500],  // 1 streamable
+			vec![3u8; big],   // 2 copyable
+			vec![4u8; 2500],  // 3 streamable
+			vec![5u8; big],   // 4 copyable
+			vec![6u8; 3500],  // 5 streamable
+			vec![7u8; big],   // 6 copyable
+			vec![8u8; 4500],  // 7 streamable
+			vec![9u8; big],   // 8 copyable
+			vec![10u8; 5500], // 9 streamable
+		];
+		let names: Vec<String> = raw.iter().map(|c| sha256_hex(c)).collect();
+
+		let files: Vec<SourceFile> = (0..raw.len())
+			.map(|i| SourceFile {
+				id: FileId(i as u32),
+				key: format!("files/{}", names[i]),
+				name: names[i].clone(),
+				size: raw[i].len() as u64,
+			})
+			.collect();
+
+		let mut plan = match plan(files) {
+			Routing::CopyPart(p) => p,
+			Routing::Fallback => panic!("expected fast path"),
+		};
+
+		// Fill copyable CRCs (phase-1 stand-in) from the synthetic content.
+		let ids: Vec<FileId> = plan.copyable.clone();
+		for id in ids {
+			let content = &raw[id.0 as usize];
+			if let Some(e) = plan.entries.get_mut(&id) {
+				e.crc = Some(crc32(content));
+			}
+		}
+
+		// Helper: bytes of one entry's local header (CRC from store) — copyable needs the
+		// filled CRC; streamable computes from content.
+		let header_bytes = |id: FileId| -> Vec<u8> {
+			let e = &plan.entries[&id];
+			let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
+			zip_format::local_header(&EntryMeta {
+				name: e.name.clone(),
+				size: e.size,
+				crc,
+				local_header_offset: e.local_header_offset,
+			})
+		};
+
+		// ---- Build each chain object exactly as build_chain_object would: concat its parts ----
+		// For a Copy part: [body of id].  (Its header rides the PRECEDING stream part's tail.)
+		// For a Stream part: for each segment, StreamedFile => [header][body], CopiedFileHeader => [header].
+		// Index chains by final_merge_part_number so we can concat in merge order.
+		let mut chain_objs: Vec<(u32, Vec<u8>)> = Vec::new();
+		for chain in &plan.chains {
+			let mut obj: Vec<u8> = Vec::new();
+			for part in &chain.parts {
+				match part {
+					PartSpec::Copy { id, .. } => {
+						obj.extend_from_slice(&raw[id.0 as usize]); // body only
+					}
+					PartSpec::Stream { segments, .. } => {
+						for seg in segments {
+							match seg {
+								Segment::StreamedFile { id } => {
+									obj.extend_from_slice(&header_bytes(*id));
+									obj.extend_from_slice(&raw[id.0 as usize]);
+								}
+								Segment::CopiedFileHeader { id } => {
+									obj.extend_from_slice(&header_bytes(*id));
+								}
+							}
+						}
+					}
+				}
+			}
+			chain_objs.push((chain.final_merge_part_number, obj));
+		}
+		// Concatenate chain objects in merge-part-number order (the archive's entry region).
+		chain_objs.sort_by_key(|(n, _)| *n);
+		let mut archive: Vec<u8> = Vec::new();
+		for (_, obj) in &chain_objs {
+			archive.extend_from_slice(obj);
+		}
+
+		// ---- Append the central directory + end records, exactly like build_central_directory ----
+		let mut cd_offset = 0u64;
+		for id in &plan.order {
+			let e = &plan.entries[id];
+			cd_offset += zip_format::entry_total_len(&e.name, e.size);
+		}
+		// sanity: the entry region we built by concatenating chains must equal cd_offset
+		assert_eq!(
+			archive.len() as u64,
+			cd_offset,
+			"chain-concatenated entry region ({}) != directory's cd_offset ({}). \
+             Chain/merge layout disagrees with plan.order offsets — archive would be invalid.",
+			archive.len(),
+			cd_offset
+		);
+
+		let mut cd_size = 0u64;
+		for id in &plan.order {
+			let e = &plan.entries[id];
+			let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
+			let rec = zip_format::central_dir_entry(&EntryMeta {
+				name: e.name.clone(),
+				size: e.size,
+				crc,
+				local_header_offset: e.local_header_offset,
+			});
+			cd_size += rec.len() as u64;
+			archive.extend_from_slice(&rec);
+		}
+		archive.extend_from_slice(&zip_format::end_records(
+			plan.order.len() as u64,
+			cd_offset,
+			cd_size,
+		));
+
+		// ---- Validate exactly like the control Lambda ----
+		let mut expected: HashSet<String> = plan
+			.order
+			.iter()
+			.map(|id| plan.entries[id].name.clone())
+			.collect();
+		let mut za = zip::ZipArchive::new(Cursor::new(&archive))
+			.expect("production-layout archive must parse with the standard zip reader");
+		assert_eq!(za.len(), plan.order.len());
+		let arch_names: Vec<String> = za.file_names().map(ToOwned::to_owned).collect();
+		for n in &arch_names {
+			assert!(!n.contains('/'), "flat layout required");
+			assert!(expected.remove(n), "unknown/duplicate {n}");
+		}
+		assert!(expected.is_empty(), "missing entries: {expected:?}");
+		for n in &arch_names {
+			let mut entry = za.by_name(n).unwrap();
+			let mut buf = Vec::new();
+			entry
+				.read_to_end(&mut buf)
+				.expect("extract (CRC verified by reader)");
+			assert_eq!(&sha256_hex(&buf), n, "content hash == name");
+		}
+	}
 }
