@@ -146,7 +146,7 @@ Resources:
       FunctionName: !Sub ${ProjectName}-typescript-sebsto
       CodeUri: ../contenders/typescript/sebsto
       Runtime: nodejs22.x
-      MemorySize: 512
+      MemorySize: 1280
       Timeout: 600
       Handler: index.handler
       Architectures:
