@@ -1,10 +1,6 @@
 //! ============================================================================
 //! STATUS — read before trusting this module.
 //!
-//! WRITTEN BUT NOT COMPILED HERE (no Rust toolchain in the authoring sandbox).
-//! The pure engine (zip_format, plan, crc) is compiled+tested on your box and green.
-//! This AWS layer needs `cargo build` + an integration run to confirm:
-//!
 //!   [ ] SDK method/field names match your pinned aws-sdk-s3 version. Used here:
 //!       create_multipart_upload().upload_id()
 //!       upload_part().body(ByteStream).part_number().e_tag()
@@ -46,17 +42,17 @@ use std::sync::Arc;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::StreamExt;
 use tokio::sync::Semaphore;
 
 use crate::engine::crc::decode_s3_crc32;
-use crate::engine::plan::{Chain, Entry, PartSpec, Plan, Segment};
+use crate::engine::plan::{Chain, Entry, FileId, PartSpec, Plan, Segment};
 use crate::engine::zip_format::{self, EntryMeta};
 
 /// Tunables. Stream concurrency saturates the ENI; control concurrency bounds off-ENI calls.
-const STREAM_CONCURRENCY: usize = 48;
-const CONTROL_CONCURRENCY: usize = 64;
-const CRC_CONCURRENCY: usize = 128;
+const STREAM_CONCURRENCY: usize = 24;
+const CHAIN_CONCURRENCY: usize = 16;
+const CRC_CONCURRENCY: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssembleError {
@@ -102,77 +98,67 @@ pub async fn assemble(
 	//
 	// Intermediate chain objects are written under a temp prefix so they can be copied
 	// server-side into the archive and then abandoned (lifecycle / explicit delete).
-	let chain_sem = Arc::new(Semaphore::new(CONTROL_CONCURRENCY));
 	let stream_sem = Arc::new(Semaphore::new(STREAM_CONCURRENCY));
 
 	// Collect final-merge completed parts (chain copies + the directory part).
 	let mut final_parts: Vec<CompletedPart> = Vec::new();
 
-	let mut chain_futs = FuturesUnordered::new();
-	for (chain_idx, chain) in plan.chains.iter().enumerate() {
-		let s3 = s3.clone();
-		let plan = plan.clone();
-		let bucket = bucket.to_string();
-		let files_prefix = files_prefix.to_string();
-		// Temp chain objects MUST live under archives/ (only place PutObject is granted).
-		// Harmless to validation (control reads one key) and cleaned by the SFN between runs.
-		let chain_key = format!(
-			"archives/.tmp-chains/{}-{}",
-			archive_basename(archive_key),
-			chain_idx
-		);
-		let chain = chain.clone();
-		let chain_sem = chain_sem.clone();
-		let stream_sem = stream_sem.clone();
-		chain_futs.push(async move {
-			let _permit = chain_sem.acquire_owned().await.unwrap();
-			let etag = build_chain_object(
-				&s3,
-				&bucket,
-				&files_prefix,
-				&chain_key,
-				&plan,
-				&chain,
-				&stream_sem,
-			)
-			.await?;
-			Ok::<_, AssembleError>((chain.final_merge_part_number, chain_key, etag))
-		});
-	}
-
-	// As each chain object completes, copy it into the archive MPU at its slot.
-	let mut merge_copy_futs = FuturesUnordered::new();
-	while let Some(res) = chain_futs.next().await {
-		let (part_number, chain_key, _chain_etag) = res?;
-		let s3 = s3.clone();
-		let bucket = bucket.to_string();
-		let archive_key = archive_key.to_string();
-		let archive_upload_id = archive_upload_id.clone();
-		merge_copy_futs.push(async move {
-			let copy_source = format!("{bucket}/{chain_key}");
-			let out = s3
-				.upload_part_copy()
-				.bucket(&bucket)
-				.key(&archive_key)
-				.upload_id(&archive_upload_id)
-				.part_number(part_number as i32)
-				.copy_source(copy_source)
-				.send()
+	// Build chains with BOUNDED concurrency: only CHAIN_CONCURRENCY are instantiated at a
+	// time (buffer_unordered pulls lazily), which bounds open file descriptors and memory.
+	// Each completed chain immediately fires its final-merge UploadPartCopy into its slot.
+	let archive_basename_s = archive_basename(archive_key);
+	let chain_jobs =
+		futures::stream::iter(plan.chains.iter().enumerate().map(|(chain_idx, chain)| {
+			let s3 = s3.clone();
+			let plan = plan.clone();
+			let bucket = bucket.to_string();
+			let files_prefix = files_prefix.to_string();
+			let archive_key = archive_key.to_string();
+			let archive_upload_id = archive_upload_id.clone();
+			let stream_sem = stream_sem.clone();
+			let chain_key = format!("archives/.tmp-chains/{}-{}", archive_basename_s, chain_idx);
+			let chain = chain.clone();
+			async move {
+				// Build the chain object (its own MPU).
+				let _etag = build_chain_object(
+					&s3,
+					&bucket,
+					&files_prefix,
+					&chain_key,
+					&plan,
+					&chain,
+					&stream_sem,
+				)
 				.await?;
-			let etag = out
-				.copy_part_result()
-				.and_then(|r| r.e_tag())
-				.ok_or(AssembleError::NoEtag("upload_part_copy"))?
-				.to_string();
-			Ok::<_, AssembleError>(
-				CompletedPart::builder()
-					.part_number(part_number as i32)
-					.e_tag(etag)
-					.build(),
-			)
-		});
-	}
-	while let Some(res) = merge_copy_futs.next().await {
+				// Copy it into the archive MPU at its pre-assigned slot.
+				let part_number = chain.final_merge_part_number as i32;
+				let copy_source = format!("{bucket}/{chain_key}");
+				let out = s3
+					.upload_part_copy()
+					.bucket(&bucket)
+					.key(&archive_key)
+					.upload_id(&archive_upload_id)
+					.part_number(part_number)
+					.copy_source(copy_source)
+					.send()
+					.await?;
+				let etag = out
+					.copy_part_result()
+					.and_then(|r| r.e_tag())
+					.ok_or(AssembleError::NoEtag("upload_part_copy"))?
+					.to_string();
+				Ok::<_, AssembleError>(
+					CompletedPart::builder()
+						.part_number(part_number)
+						.e_tag(etag)
+						.build(),
+				)
+			}
+		}))
+		.buffer_unordered(CHAIN_CONCURRENCY);
+
+	futures::pin_mut!(chain_jobs);
+	while let Some(res) = chain_jobs.next().await {
 		final_parts.push(res?);
 	}
 
@@ -381,28 +367,42 @@ async fn fill_copyable_crcs(
 	files_prefix: &str,
 	plan: &mut Plan,
 ) -> Result<(), AssembleError> {
-	let sem = Arc::new(Semaphore::new(CRC_CONCURRENCY));
-	let mut futs = FuturesUnordered::new();
-	for id in plan.copyable.clone() {
-		let entry = plan.entries.get(&id).expect("copyable id in entries");
-		let key = format!("{files_prefix}/{}", entry.name);
-		let s3 = s3.clone();
-		let bucket = bucket.to_string();
-		let sem = sem.clone();
-		futs.push(async move {
-			let _p = sem.acquire_owned().await.unwrap();
-			let out = s3
-				.head_object()
-				.bucket(&bucket)
-				.key(&key)
-				.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
-				.send()
-				.await?;
-			let crc_b64 = out.checksum_crc32().map(ToOwned::to_owned);
-			Ok::<_, AssembleError>((id, crc_b64))
-		});
-	}
-	while let Some(res) = futs.next().await {
+	// Resolve (name) for each copyable id first, then fetch CRCs with bounded concurrency.
+	let jobs: Vec<(FileId, String)> = plan
+		.copyable
+		.iter()
+		.map(|id| {
+			let name = plan
+				.entries
+				.get(id)
+				.expect("copyable id in entries")
+				.name
+				.clone();
+			(*id, format!("{files_prefix}/{}", name))
+		})
+		.collect();
+
+	let results: Vec<Result<(FileId, Option<String>), AssembleError>> =
+		futures::stream::iter(jobs.into_iter().map(|(id, key)| {
+			let s3 = s3.clone();
+			let bucket = bucket.to_string();
+			async move {
+				let out = s3
+					.head_object()
+					.bucket(&bucket)
+					.key(&key)
+					.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+					.send()
+					.await?;
+				let crc_b64 = out.checksum_crc32().map(ToOwned::to_owned);
+				Ok::<_, AssembleError>((id, crc_b64))
+			}
+		}))
+		.buffer_unordered(CRC_CONCURRENCY)
+		.collect()
+		.await;
+
+	for res in results {
 		let (id, crc_b64) = res?;
 		let crc = crc_b64
 			.as_deref()
