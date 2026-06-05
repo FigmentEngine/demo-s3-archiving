@@ -12,6 +12,7 @@
 //! - bookkeeping is plain maps/counters updated in one place as futures complete.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
@@ -24,7 +25,7 @@ use crate::engine::plan::{Chain, Entry, FileId, PartSpec, Plan, Segment};
 use crate::engine::zip_format::{self, EntryMeta};
 
 /// Tunables. Stream concurrency saturates the ENI; control concurrency bounds off-ENI calls.
-const STREAM_CONCURRENCY: usize = 32;
+const STREAM_CONCURRENCY: usize = 24;
 const CHAIN_CONCURRENCY: usize = 16;
 const CRC_CONCURRENCY: usize = 64;
 /// Concurrent parts within a single chain (matters for the first chain, ~1,200 parts).
@@ -62,7 +63,13 @@ pub async fn assemble(
 ) -> Result<(), AssembleError> {
 	// ---- Phase 1: fetch CRCs for copyable entries (HEAD + checksum-mode), await all ----
 	// Streamable entries' CRCs are computed from their bodies during streaming.
+	let t_crc = Instant::now();
 	fill_crcs(s3, bucket, files_prefix, &mut plan).await?;
+	tracing::info!(
+		ms = t_crc.elapsed().as_millis(),
+		entries = plan.order.len(),
+		"PHASE crc_heads"
+	);
 	let plan = Arc::new(plan);
 
 	// ---- Open the final-merge (archive) MPU up front so copies can flow in as-you-go ----
@@ -84,6 +91,7 @@ pub async fn assemble(
 	// NOT consume a slot in the normal-chain pool. The normal chains (mostly off-ENI copies +
 	// one tiny GET each) run concurrently in a bounded pool; total wall-clock becomes
 	// max(first chain, normal chains) rather than them contending for the same slots.
+	let t_chains = Instant::now();
 	let first_stream_sem = Arc::new(Semaphore::new(STREAM_CONCURRENCY));
 	let first_handle = {
 		let s3 = s3.clone();
@@ -95,7 +103,8 @@ pub async fn assemble(
 		let chain = plan.chains[0].clone();
 		let chain_key = format!("archives/.tmp-chains/{}-0", archive_basename_s);
 		tokio::spawn(async move {
-			process_chain(
+			let t = Instant::now();
+			let r = process_chain(
 				&s3,
 				&bucket,
 				&files_prefix,
@@ -106,7 +115,13 @@ pub async fn assemble(
 				&chain,
 				&first_stream_sem,
 			)
-			.await
+			.await;
+			tracing::info!(
+				ms = t.elapsed().as_millis(),
+				parts = chain.parts.len(),
+				"PHASE first_chain"
+			);
+			r
 		})
 	};
 
@@ -145,14 +160,24 @@ pub async fn assemble(
 	while let Some(res) = chain_jobs.next().await {
 		final_parts.push(res?);
 	}
+	tracing::info!(
+		ms = t_chains.elapsed().as_millis(),
+		n = plan.chains.len() - 1,
+		"PHASE normal_pool_drained"
+	);
 
 	// Join the first chain (its merge-copy part).
 	let first_part = first_handle
 		.await
 		.map_err(|e| AssembleError::BadCrc(format!("first-chain task join: {e}")))??;
 	final_parts.push(first_part);
+	tracing::info!(
+		ms = t_chains.elapsed().as_millis(),
+		"PHASE all_chains_joined"
+	);
 
 	// ---- Directory part: last part of the archive MPU (exempt from 5 MiB) ----
+	let t_dir = Instant::now();
 	let dir_part_number = (plan.chains.len() as i32) + 1;
 	let dir_bytes = build_central_directory(&plan)?;
 	let out = s3
@@ -174,8 +199,10 @@ pub async fn assemble(
 			.e_tag(dir_etag)
 			.build(),
 	);
+	tracing::info!(ms = t_dir.elapsed().as_millis(), "PHASE directory_part");
 
 	// ---- Terminal complete ----
+	let t_complete = Instant::now();
 	final_parts.sort_by_key(|p| p.part_number());
 	let completed = CompletedMultipartUpload::builder()
 		.set_parts(Some(final_parts))
@@ -187,6 +214,10 @@ pub async fn assemble(
 		.multipart_upload(completed)
 		.send()
 		.await?;
+	tracing::info!(
+		ms = t_complete.elapsed().as_millis(),
+		"PHASE terminal_complete"
+	);
 
 	Ok(())
 }
