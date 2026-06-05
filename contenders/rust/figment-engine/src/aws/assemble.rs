@@ -1,28 +1,3 @@
-//! ============================================================================
-//! STATUS — read before trusting this module.
-//!
-//!   [ ] SDK method/field names match your pinned aws-sdk-s3 version. Used here:
-//!       create_multipart_upload().upload_id()
-//!       upload_part().body(ByteStream).part_number().e_tag()
-//!       upload_part_copy().copy_source("bucket/key").part_number()
-//!           .copy_part_result().e_tag()
-//!       complete_multipart_upload().multipart_upload(CompletedMultipartUpload)
-//!       head_object().checksum_mode(ChecksumMode::Enabled).checksum_crc32()
-//!       get_object().body.next()
-//!   [ ] `futures` crate is available (FuturesUnordered, StreamExt). Add if needed.
-//!
-//! KNOWN FIRST-CUT SIMPLIFICATION (correct, not yet maximally fast):
-//!   Within a single chain, parts run sequentially (copy then stream), not concurrently.
-//!   Chains run concurrently (CONTROL_CONCURRENCY) and stream parts are globally bounded
-//!   (STREAM_CONCURRENCY), so the ENI is still driven by many concurrent chains. The
-//!   pure event-driven per-part two-pool refinement can come AFTER an end-to-end pass.
-//!
-//! TEMP OBJECTS: chain objects are written under archives/.tmp-chains/ (only place the
-//! contender role allows PutObject). They are harmless to validation (control Lambda
-//! reads one archive key) and cleaned by the benching Step Function between runs (it has
-//! DeleteObject on archives/*). We never need DeleteObject ourselves.
-//! ============================================================================
-
 //! AWS executor: takes a realised `Plan` and produces the archive in S3.
 //!
 //! Depends on `aws_sdk_s3`. Holds NONE of the correctness-critical layout logic — that
@@ -41,7 +16,7 @@ use std::sync::Arc;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use futures::stream::StreamExt;
+use futures::stream::{StreamExt, TryStreamExt};
 use tokio::sync::Semaphore;
 
 use crate::engine::crc::decode_s3_crc32;
@@ -49,9 +24,11 @@ use crate::engine::plan::{Chain, Entry, FileId, PartSpec, Plan, Segment};
 use crate::engine::zip_format::{self, EntryMeta};
 
 /// Tunables. Stream concurrency saturates the ENI; control concurrency bounds off-ENI calls.
-const STREAM_CONCURRENCY: usize = 48;
-const CHAIN_CONCURRENCY: usize = 32;
-const CRC_CONCURRENCY: usize = 128;
+const STREAM_CONCURRENCY: usize = 24;
+const CHAIN_CONCURRENCY: usize = 16;
+const CRC_CONCURRENCY: usize = 64;
+/// Concurrent parts within a single chain (matters for the first chain, ~1,200 parts).
+const PART_CONCURRENCY: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssembleError {
@@ -265,63 +242,39 @@ async fn build_chain_object(
 	stream_sem: &Arc<Semaphore>,
 ) -> Result<String, AssembleError> {
 	let upload_id = create_mpu(s3, bucket, chain_key).await?;
-	let mut parts: Vec<CompletedPart> = Vec::new();
 
+	// Parts within a chain are independent (pre-assigned part numbers, ETags collected at
+	// the end, S3 assembles by number at Complete). Run them concurrently: this is what
+	// lets the FIRST chain — which has ~1,200 stream parts for ~6 GB — stream wide instead
+	// of one-part-at-a-time. Normal chains have a single stream part so this is a no-op for
+	// them. Memory is bounded by `stream_sem` (acquired inside each stream part before the
+	// GET/alloc), so at most STREAM_CONCURRENCY part buffers are resident at once.
+	//
+	// The per-part work is a named async fn (not an inline closure) so its lifetimes are
+	// well-formed under the surrounding tokio::spawn — a closure returning an async block
+	// trips higher-ranked-lifetime inference here.
+	// well-formed under the surrounding tokio::spawn. Build the futures with a plain loop
+	// (no closure capturing `part` across a borrow boundary) so the spawn's 'static bound
+	// doesn't trip higher-ranked-lifetime inference on a map closure.
+	let upload_id = upload_id.as_str();
+	let mut part_futures = Vec::with_capacity(chain.parts.len());
 	for part in &chain.parts {
-		match part {
-			PartSpec::Copy { part_number, id } => {
-				let entry = &plan.entries[id];
-				let copy_source = format!("{bucket}/{files_prefix}/{}", entry.name);
-				let out = s3
-					.upload_part_copy()
-					.bucket(bucket)
-					.key(chain_key)
-					.upload_id(&upload_id)
-					.part_number(*part_number as i32)
-					.copy_source(copy_source)
-					.send()
-					.await?;
-				let etag = out
-					.copy_part_result()
-					.and_then(|r| r.e_tag())
-					.ok_or(AssembleError::NoEtag("chain upload_part_copy"))?
-					.to_string();
-				parts.push(
-					CompletedPart::builder()
-						.part_number(*part_number as i32)
-						.e_tag(etag)
-						.build(),
-				);
-			}
-			PartSpec::Stream {
-				part_number,
-				segments,
-			} => {
-				let _permit = stream_sem.acquire().await.unwrap();
-				let body =
-					build_stream_part_bytes(s3, bucket, files_prefix, plan, segments).await?;
-				let out = s3
-					.upload_part()
-					.bucket(bucket)
-					.key(chain_key)
-					.upload_id(&upload_id)
-					.part_number(*part_number as i32)
-					.body(ByteStream::from(body))
-					.send()
-					.await?;
-				let etag = out
-					.e_tag()
-					.ok_or(AssembleError::NoEtag("chain stream upload_part"))?
-					.to_string();
-				parts.push(
-					CompletedPart::builder()
-						.part_number(*part_number as i32)
-						.e_tag(etag)
-						.build(),
-				);
-			}
-		}
+		part_futures.push(build_one_part(
+			s3,
+			bucket,
+			files_prefix,
+			chain_key,
+			upload_id,
+			plan,
+			stream_sem,
+			part,
+		));
 	}
+
+	let mut parts: Vec<CompletedPart> = futures::stream::iter(part_futures)
+		.buffer_unordered(PART_CONCURRENCY)
+		.try_collect()
+		.await?;
 
 	parts.sort_by_key(|p| p.part_number());
 	let completed = CompletedMultipartUpload::builder()
@@ -331,13 +284,77 @@ async fn build_chain_object(
 		.complete_multipart_upload()
 		.bucket(bucket)
 		.key(chain_key)
-		.upload_id(&upload_id)
+		.upload_id(upload_id)
 		.multipart_upload(completed)
 		.send()
 		.await?;
 	out.e_tag()
 		.map(ToOwned::to_owned)
 		.ok_or(AssembleError::NoEtag("chain complete"))
+}
+
+/// Process one part of a chain MPU: a Copy part issues UploadPartCopy from the source file;
+/// a Stream part acquires the stream permit (memory backstop), materialises its bytes, and
+/// UploadPart's them. Named fn (not a closure) for well-formed lifetimes under buffer_unordered.
+#[allow(clippy::too_many_arguments)]
+async fn build_one_part(
+	s3: &Client,
+	bucket: &str,
+	files_prefix: &str,
+	chain_key: &str,
+	upload_id: &str,
+	plan: &Plan,
+	stream_sem: &Arc<Semaphore>,
+	part: &PartSpec,
+) -> Result<CompletedPart, AssembleError> {
+	match part {
+		PartSpec::Copy { part_number, id } => {
+			let entry = &plan.entries[id];
+			let copy_source = format!("{bucket}/{files_prefix}/{}", entry.name);
+			let out = s3
+				.upload_part_copy()
+				.bucket(bucket)
+				.key(chain_key)
+				.upload_id(upload_id)
+				.part_number(*part_number as i32)
+				.copy_source(copy_source)
+				.send()
+				.await?;
+			let etag = out
+				.copy_part_result()
+				.and_then(|r| r.e_tag())
+				.ok_or(AssembleError::NoEtag("chain upload_part_copy"))?
+				.to_string();
+			Ok(CompletedPart::builder()
+				.part_number(*part_number as i32)
+				.e_tag(etag)
+				.build())
+		}
+		PartSpec::Stream {
+			part_number,
+			segments,
+		} => {
+			let _permit = stream_sem.acquire().await.unwrap();
+			let body = build_stream_part_bytes(s3, bucket, files_prefix, plan, segments).await?;
+			let out = s3
+				.upload_part()
+				.bucket(bucket)
+				.key(chain_key)
+				.upload_id(upload_id)
+				.part_number(*part_number as i32)
+				.body(ByteStream::from(body))
+				.send()
+				.await?;
+			let etag = out
+				.e_tag()
+				.ok_or(AssembleError::NoEtag("chain stream upload_part"))?
+				.to_string();
+			Ok(CompletedPart::builder()
+				.part_number(*part_number as i32)
+				.e_tag(etag)
+				.build())
+		}
+	}
 }
 
 /// Materialise a stream part's bytes: for each segment, either GET a small file and emit
