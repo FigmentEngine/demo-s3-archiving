@@ -230,15 +230,18 @@ pub async fn assemble(
 		let archive_key = archive_key.to_string();
 		let archive_upload_id = archive_upload_id.clone();
 		async move {
-			let out = s3
-				.upload_part_copy()
-				.bucket(&bucket)
-				.key(&archive_key)
-				.upload_id(&archive_upload_id)
-				.part_number(part_number as i32)
-				.copy_source(format!("{bucket}/{final_key}"))
-				.send()
-				.await?;
+			let out = retry_on_slowdown(|| async {
+				Ok(s3
+					.upload_part_copy()
+					.bucket(&bucket)
+					.key(&archive_key)
+					.upload_id(&archive_upload_id)
+					.part_number(part_number as i32)
+					.copy_source(format!("{bucket}/{final_key}"))
+					.send()
+					.await?)
+			})
+			.await?;
 			let etag = out
 				.copy_part_result()
 				.and_then(|r| r.e_tag())
@@ -460,21 +463,24 @@ async fn run_copy_mpu(
 	key: &str,
 	parts: &[CopyPart],
 ) -> Result<(), AssembleError> {
-	let upload_id = create_mpu(s3, bucket, key).await?;
+	let upload_id = retry_on_slowdown(|| async { create_mpu(s3, bucket, key).await }).await?;
 	let mut completed: Vec<CompletedPart> = Vec::with_capacity(parts.len());
 	for (i, p) in parts.iter().enumerate() {
 		let pn = (i + 1) as i32;
-		let mut req = s3
-			.upload_part_copy()
-			.bucket(bucket)
-			.key(key)
-			.upload_id(&upload_id)
-			.part_number(pn)
-			.copy_source(&p.source);
-		if let Some((first, last)) = p.range {
-			req = req.copy_source_range(format!("bytes={first}-{last}"));
-		}
-		let out = req.send().await?;
+		let out = retry_on_slowdown(|| async {
+			let mut req = s3
+				.upload_part_copy()
+				.bucket(bucket)
+				.key(key)
+				.upload_id(&upload_id)
+				.part_number(pn)
+				.copy_source(&p.source);
+			if let Some((first, last)) = p.range {
+				req = req.copy_source_range(format!("bytes={first}-{last}"));
+			}
+			Ok(req.send().await?)
+		})
+		.await?;
 		let etag = out
 			.copy_part_result()
 			.and_then(|r| r.e_tag())
@@ -485,14 +491,54 @@ async fn run_copy_mpu(
 	let mpu = CompletedMultipartUpload::builder()
 		.set_parts(Some(completed))
 		.build();
-	s3.complete_multipart_upload()
-		.bucket(bucket)
-		.key(key)
-		.upload_id(&upload_id)
-		.multipart_upload(mpu)
-		.send()
-		.await?;
+	retry_on_slowdown(|| async {
+		Ok(s3
+			.complete_multipart_upload()
+			.bucket(bucket)
+			.key(key)
+			.upload_id(&upload_id)
+			.multipart_upload(mpu.clone())
+			.send()
+			.await?)
+	})
+	.await?;
 	Ok(())
+}
+
+/// Retry an S3 operation on transient throttling (S3 503 SlowDown / ServiceUnavailable) with
+/// jittered exponential backoff. At ~19k copy requests in a ~40s window we exceed the per-prefix
+/// write rate; the layer waves burst wide, so a 503 here is expected, not fatal. Up to 6 attempts
+/// (~50ms..~1.6s + jitter), then surface the error.
+async fn retry_on_slowdown<T, F, Fut>(mut op: F) -> Result<T, AssembleError>
+where
+	F: FnMut() -> Fut,
+	Fut: std::future::Future<Output = Result<T, AssembleError>>,
+{
+	const MAX_ATTEMPTS: u32 = 6;
+	let mut attempt = 0u32;
+	loop {
+		match op().await {
+			Ok(v) => return Ok(v),
+			Err(e) if attempt + 1 < MAX_ATTEMPTS && is_slowdown(&e) => {
+				// base 50ms doubling, plus up to ~50% jitter to de-sync the wave. Jitter source
+				// is the clock's sub-millisecond nanos — no RNG dependency needed.
+				let base_ms = 50u64 << attempt;
+				let jitter = (std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map(|d| d.subsec_nanos() as u64)
+					.unwrap_or(0)) % (base_ms / 2 + 1);
+				tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter)).await;
+				attempt += 1;
+			}
+			Err(e) => return Err(e),
+		}
+	}
+}
+
+/// True if the error is an S3 throttle worth retrying (SlowDown / 503 / ServiceUnavailable).
+fn is_slowdown(e: &AssembleError) -> bool {
+	let s = e.to_string();
+	s.contains("SlowDown") || s.contains("ServiceUnavailable") || s.contains("503")
 }
 
 /// Build one chain object (its own MPU) and return its ETag. Streamed parts GET their
