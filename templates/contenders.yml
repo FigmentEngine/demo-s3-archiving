@@ -189,7 +189,7 @@ Resources:
         Variables:
           # RUST_LOG configures the `tracing` crate's log filter:
           # debug for app code, info for noisy AWS SDK internals
-          RUST_LOG: warn # debug,hyper=info,h2=info,tracing=info,aws_config=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,rustls=info
+          RUST_LOG: info # debug,hyper=info,h2=info,tracing=info,aws_config=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,rustls=info
       Role: !GetAtt LambdaContenderRole.Arn
   RustFigmentEngineFunctionLogGroup:
     Type: AWS::Logs::LogGroup
