@@ -31,7 +31,7 @@ const CRC_CONCURRENCY: usize = 64;
 /// Concurrent parts within a single chain (matters for the first chain, ~1,200 parts).
 const PART_CONCURRENCY: usize = 32;
 /// Across-chain concurrency for each layer wave (server-side copies; bound for FD/throttle).
-const LAYER_CONCURRENCY: usize = 64;
+const LAYER_CONCURRENCY: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssembleError {
