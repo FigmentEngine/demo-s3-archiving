@@ -11,6 +11,7 @@
 //! bottom of this file; it wires up OpenTelemetry/X-Ray tracing, an instrumented S3 client
 //! accessible via `s3()`, and the Lambda runtime invoking [`handler`].
 
+mod engine;
 mod slabs_buffer;
 mod zipper;
 
