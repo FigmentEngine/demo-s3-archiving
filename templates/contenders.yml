@@ -196,6 +196,138 @@ Resources:
     Properties:
       LogGroupName: !Sub /aws/lambda/${RustFigmentEngineFunction}
       RetentionInDays: 90
+
+  RustFigmentEngineFunction768MiB:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-rust-figment-engine-768MiB
+      CodeUri: ../contenders/rust/figment-engine
+      Runtime: provided.al2023
+      MemorySize: 768
+      Timeout: 600
+      Handler: rust.handler
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          RUST_LOG: info
+      Role: !GetAtt LambdaContenderRole.Arn
+
+  RustFigmentEngineFunction768MiBLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-rust-figment-engine-768MiB
+      RetentionInDays: 90
+
+  RustFigmentEngineFunction1024MiB:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-rust-figment-engine-1024MiB
+      CodeUri: ../contenders/rust/figment-engine
+      Runtime: provided.al2023
+      MemorySize: 1024
+      Timeout: 600
+      Handler: rust.handler
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          RUST_LOG: info
+      Role: !GetAtt LambdaContenderRole.Arn
+
+  RustFigmentEngineFunction1024MiBLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-rust-figment-engine-1024MiB
+      RetentionInDays: 90
+
+  RustFigmentEngineFunction1280MiB:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-rust-figment-engine-1280MiB
+      CodeUri: ../contenders/rust/figment-engine
+      Runtime: provided.al2023
+      MemorySize: 1280
+      Timeout: 600
+      Handler: rust.handler
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          RUST_LOG: info
+      Role: !GetAtt LambdaContenderRole.Arn
+
+  RustFigmentEngineFunction1280MiBLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-rust-figment-engine-1280MiB
+      RetentionInDays: 90
+
+  RustFigmentEngineFunction1536MiB:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-rust-figment-engine-1536MiB
+      CodeUri: ../contenders/rust/figment-engine
+      Runtime: provided.al2023
+      MemorySize: 1536
+      Timeout: 600
+      Handler: rust.handler
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          RUST_LOG: info
+      Role: !GetAtt LambdaContenderRole.Arn
+
+  RustFigmentEngineFunction1536MiBLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-rust-figment-engine-1536MiB
+      RetentionInDays: 90
+
+  RustFigmentEngineFunction1792MiB:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-rust-figment-engine-1792MiB
+      CodeUri: ../contenders/rust/figment-engine
+      Runtime: provided.al2023
+      MemorySize: 1792
+      Timeout: 600
+      Handler: rust.handler
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          RUST_LOG: info
+      Role: !GetAtt LambdaContenderRole.Arn
+
+  RustFigmentEngineFunction1792MiBLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-rust-figment-engine-1792MiB
+      RetentionInDays: 90
+
+  RustFigmentEngineFunction2048MiB:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-rust-figment-engine-2048MiB
+      CodeUri: ../contenders/rust/figment-engine
+      Runtime: provided.al2023
+      MemorySize: 2048
+      Timeout: 600
+      Handler: rust.handler
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          RUST_LOG: info
+      Role: !GetAtt LambdaContenderRole.Arn
+
+  RustFigmentEngineFunction2048MiBLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-rust-figment-engine-2048MiB
+      RetentionInDays: 90
   # ------------------------------ END CONTENDERS --------------------------------
 
 # Outputs — the list of contender ARNs is consumed by the benching Step Function
@@ -214,4 +346,10 @@ Outputs:
           - !GetAtt SwiftSebstoSotoFunction.Arn
           - !GetAtt RustJeremieRodonFunction.Arn
           - !GetAtt RustFigmentEngineFunction.Arn
+          - !GetAtt RustFigmentEngineFunction768MiB.Arn
+          - !GetAtt RustFigmentEngineFunction1024MiB.Arn
+          - !GetAtt RustFigmentEngineFunction1280MiB.Arn
+          - !GetAtt RustFigmentEngineFunction1536MiB.Arn
+          - !GetAtt RustFigmentEngineFunction1792MiB.Arn
+          - !GetAtt RustFigmentEngineFunction2048MiB.Arn
           # ----- END CONTENDER ARN LIST -----
