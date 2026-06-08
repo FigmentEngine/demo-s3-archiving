@@ -102,8 +102,8 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
 	// copies; the rest are forced to STREAM. By copying the biggest bigs first, the forced folds
 	// land on the SMALLEST bigs — minimising the big-bytes that cross the ENI. Ties by id for
 	// determinism. Smalls by id (their order only affects batching, not which bigs fold).
-	bigs.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.0.cmp(&b.id.0)));
-	smalls.sort_by_key(|f| f.id.0);
+	bigs.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.0.cmp(&b.id.0))); // descending
+	smalls.sort_by(|a, b| a.size.cmp(&b.size).then(a.id.0.cmp(&b.id.0))); // ascending
 
 	let mut size_of: HashMap<FileId, (String, u64)> = HashMap::new();
 	for f in bigs.iter().chain(smalls.iter()) {
