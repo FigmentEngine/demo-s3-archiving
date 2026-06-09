@@ -67,7 +67,7 @@ Resources:
   # Naming convention (STRICT — the benching Step Function relies on it):
   #
   #   - FunctionName MUST be: !Sub ${ProjectName}-<lang>-<dev_id>
-  #       e.g. ${ProjectName}-rust-jeremie-rodon
+  #       e.g. ${ProjectName}-rust-jrodon
   #
   #   - <lang>-<dev_id> SHOULD match the source directory:
   #       contenders/<lang>/<dev_id>/
@@ -201,12 +201,12 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${SwiftSebstoSotoFunction}
       RetentionInDays: 90
 
-  # Rust / jeremie-rodon  (reference implementation)
+  # Rust / jrodon  (reference implementation)
   RustJeremieRodonFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub ${ProjectName}-rust-jeremie-rodon
-      CodeUri: ../contenders/rust/jeremie-rodon
+      FunctionName: !Sub ${ProjectName}-rust-jrodon
+      CodeUri: ../contenders/rust/jrodon
       # provided.al2023 is the custom runtime for compiled binaries (Rust, Go, C++).
       # The Lambda service executes the `bootstrap` binary directly.
       Runtime: provided.al2023
