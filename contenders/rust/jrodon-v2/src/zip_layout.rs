@@ -77,8 +77,8 @@ impl ZipLayout {
             //             - loc_size          (LOC header goes in the regular part)
             //             - (file_size - MIN_PART_SIZE)  (bytes the copy can "donate" to regular)
             let min_missing_regular_part_size = MIN_PART_SIZE
-                - big_file_entry.loc_size()
-                - (big_file_entry.file_size() - MIN_PART_SIZE);
+                .saturating_sub(big_file_entry.loc_size())
+                .saturating_sub(big_file_entry.file_size() - MIN_PART_SIZE);
 
             let mut regular = RegularZipPart::new();
 
