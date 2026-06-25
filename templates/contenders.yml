@@ -286,6 +286,33 @@ Resources:
     Properties:
       LogGroupName: !Sub /aws/lambda/${RustFigmentEngineFunction}
       RetentionInDays: 90
+
+  # Rust / figment-engine-chain  (copy-only segment-chain — SPEED entry, ignores cost ranking)
+  # Every image body reaches the archive by server-side UploadPartCopy (bar one
+  # 5 MiB bootstrap read), so it escapes the ENI bandwidth floor and is bound by
+  # S3 control-plane call rate. Memory here is a vCPU dial, not a RAM need: start
+  # HIGH (1024 MB) so vCPU never limits the issue rate while finding the 503 knee,
+  # then lower in a second sweep. (Carries no body buffers — RAM use is trivial.)
+  RustFigmentEngineChainFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-rust-figment-engine-chain
+      CodeUri: ../contenders/rust/figment-engine-chain
+      Runtime: provided.al2023
+      MemorySize: 1024
+      Timeout: 600
+      Handler: rust.handler
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          RUST_LOG: info
+      Role: !GetAtt LambdaContenderRole.Arn
+  RustFigmentEngineChainFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${RustFigmentEngineChainFunction}
+      RetentionInDays: 90
   # ------------------------------ END CONTENDERS --------------------------------
 
 # Outputs — the list of contender ARNs is consumed by the benching Step Function
@@ -308,4 +335,5 @@ Outputs:
           - !GetAtt RustJrodonFunction.Arn
           - !GetAtt RustJrodonV2Function.Arn
           - !GetAtt RustFigmentEngineFunction.Arn
+          - !GetAtt RustFigmentEngineChainFunction.Arn
           # ----- END CONTENDER ARN LIST -----
