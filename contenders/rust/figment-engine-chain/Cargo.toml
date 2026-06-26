@@ -24,10 +24,8 @@ tracing              = { workspace = true }
 serde                = { workspace = true }
 thiserror            = { workspace = true }
 
-# Concurrency + jitter for the executor and the rate limiter. Uncomment as the
-# implementation lands (kept out until needed to keep the build lean):
-# futures  = "0.3"     # concurrent link / stitch-part driving
-# fastrand = { workspace = true }   # jitter for the 503 backstop retry
+# Concurrency for the executor (buffer_unordered over segment/stitch/CRC pools).
+futures = "0.3"
 
 [features]
 # Mirrors figment-engine: gates the assemble-and-validate round-trip test that
