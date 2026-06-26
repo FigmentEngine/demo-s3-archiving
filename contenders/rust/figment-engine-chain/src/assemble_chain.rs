@@ -34,7 +34,7 @@ use crate::plan_chain::{ChainPlan, Entry, Link, Piece, Segment};
 /// SlowDown at 64-wide and only ~690 calls/s achieved (a fifth of the knee), so
 /// the bottleneck is under-concurrency, not throttling — push this high and let
 /// the rate limiter (added later) cap it for the contended benchmark.
-const SEGMENT_CONCURRENCY: usize = 512;
+const SEGMENT_CONCURRENCY: usize = 256;
 /// HEADs for CRC — read-only, cheap, run wide (separate ~5,500/s GET/HEAD budget).
 const CRC_CONCURRENCY: usize = 256;
 /// Stitch copy-parts — server-side copies into one MPU, latency-bound.
@@ -295,10 +295,12 @@ async fn build_segment_object(
 		})
 		.await?;
 
-		// Clean up the previous link's temp object (best-effort).
-		if let Some(prev) = prev_object.take() {
-			let _ = s3.delete_object().bucket(bucket).key(&prev).send().await;
-		}
+		// NOTE: the previous link's temp object is NOT deleted here. The inline
+		// delete used to sit on the critical path — one full round-trip per link,
+		// ~4,500 serial deletes across the run, all pure housekeeping the next
+		// link doesn't depend on. All `.l{li}` temps are reaped together in the
+		// deferred `cleanup` after the archive completes, so they never compete
+		// for the serial chain's round-trip budget.
 		if !is_last_link {
 			prev_object = Some(out_key);
 		}
@@ -626,14 +628,32 @@ async fn fill_crcs(
 	Ok(())
 }
 
-/// Best-effort delete of the intermediate segment objects after the stitch.
+/// Best-effort delete of ALL intermediate objects under the `{archive_key}.seg/`
+/// prefix — both the finished segment objects (`…/{index}`) and every per-link
+/// temp (`…/{index}.l{li}`), which are no longer deleted inline during the chain.
 /// Deferred until the archive is complete so these DeleteObject calls never
-/// compete for call budget with the assembly that must succeed.
-async fn cleanup(s3: &Client, bucket: &str, n_segments: usize, archive_key: &str) {
-	futures::stream::iter((0..n_segments).map(|i| {
+/// compete for the serial chains' round-trip budget. Listed-then-deleted so it
+/// catches every temp regardless of per-segment link depth.
+async fn cleanup(s3: &Client, bucket: &str, _n_segments: usize, archive_key: &str) {
+	let prefix = format!("{archive_key}.seg/");
+	let mut keys: Vec<String> = Vec::new();
+	let mut paginator = s3
+		.list_objects_v2()
+		.bucket(bucket)
+		.prefix(&prefix)
+		.into_paginator()
+		.send();
+	while let Some(page) = paginator.next().await {
+		let Ok(page) = page else { break };
+		for obj in page.contents() {
+			if let Some(k) = obj.key() {
+				keys.push(k.to_string());
+			}
+		}
+	}
+	futures::stream::iter(keys.into_iter().map(|key| {
 		let s3 = s3.clone();
 		let bucket = bucket.to_string();
-		let key = segment_key(archive_key, i);
 		async move {
 			let _ = s3.delete_object().bucket(&bucket).key(&key).send().await;
 		}
