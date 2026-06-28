@@ -3,22 +3,11 @@ use std::collections::VecDeque;
 use tracing::{debug, info, instrument};
 
 use crate::{
-    FileInfo,
+    MIN_PART_SIZE, TARGET_PART_SIZE,
     part_executor::{PartJob, PartJobsBuilder},
+    s3_ops::FileInfo,
     zip_format::{LocalFileHeader, NoCRC},
 };
-
-// ---------- Tunables ----------
-
-/// Minimum size accepted for a non-final part in an S3 multipart upload (S3 hard limit).
-///
-/// Both the `UploadPart` and the `UploadPartCopy` halves of a Duo must individually meet this.
-const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
-
-/// Preferred part size when there are no S3 minimum-size constraints to satisfy.
-///
-/// Used to drive how many files we pack into a single part before moving on.
-const TARGET_PART_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
 // ---------- Layout planning ----------
 

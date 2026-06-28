@@ -15,7 +15,7 @@ mod tracing_macros {
     ///
     /// Used on hot paths (e.g. the per-part execution loop) to keep periodic visibility at
     /// `INFO` without drowning the logs with thousands of lines per run.
-    macro_rules! intermitent_tracing {
+    macro_rules! intermittent_tracing {
         ($index:expr, $($tt:tt)+) => {
             if $index as usize % $crate::TRACING_INFO_FREQUENCY == 0 {
                 tracing::event!(tracing::Level::INFO, $($tt)+);
@@ -26,8 +26,9 @@ mod tracing_macros {
     }
 }
 
-mod part_job;
+mod part_executor;
 mod shared_buffer;
+mod zip_format;
 mod zip_layout;
 
 use std::sync::Arc;
@@ -37,17 +38,17 @@ use serde::Deserialize;
 
 use tracing::{debug, info, instrument};
 
-use crate::{part_job::PartJobExecutor, zip_layout::ZipLayout};
+use crate::{part_executor::PartJobExecutor, zip_layout::ZipLayout};
 
 // ---------- Tunables ----------
 
-/// Switch `intermitent_tracing!` to `INFO` once every this many calls (`DEBUG` in between).
+/// Switch `intermittent_tracing!` to `INFO` once every this many calls (`DEBUG` in between).
 pub(crate) const TRACING_INFO_FREQUENCY: usize = 50;
 
 /// Crate-wide error type. The blanket `From<SdkError<E, R>>` impl below funnels all
 /// typed AWS SDK operation errors into the [`Error::S3`] variant via `aws_sdk_s3::Error`.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum Error {
+pub enum Error {
     #[error("s3 error: {0}")]
     S3(#[from] Box<aws_sdk_s3::Error>),
     #[error("s3 bytestream error: {0}")]

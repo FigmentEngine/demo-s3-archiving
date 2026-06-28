@@ -83,7 +83,7 @@ impl BufSlice {
     /// `[start_at + at, start_at + length)`. The caller must ensure `at <= length`.
     #[instrument(skip(self), fields(start_at=%self.start_at,length=%self.length))]
     pub fn split(self, at: usize) -> (Self, Self) {
-        debug!("splitting buffer");
+        debug!("spliting buffer");
         let Self {
             shared_buf,
             start_at,
