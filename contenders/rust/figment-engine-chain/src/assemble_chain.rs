@@ -220,6 +220,7 @@ where
 				if attempt >= MAX_ATTEMPTS || !retryable {
 					return Err(e);
 				}
+				rl.note_retry();
 				let base_ms = 100u64.saturating_mul(1u64 << (attempt - 1).min(7));
 				let jitter_ms = std::time::SystemTime::now()
 					.duration_since(std::time::UNIX_EPOCH)
@@ -312,7 +313,15 @@ pub async fn run(
 			for r in res {
 				r?;
 			}
-			tracing::info!(ms = t_crc.elapsed().as_millis(), "PHASE crc_heads_paced");
+			let cs = rl.stats();
+			tracing::info!(
+				ms = t_crc.elapsed().as_millis(),
+				gov_rate = cs.rate,
+				gov_throttles = cs.throttles,
+				gov_down_steps = cs.down_steps,
+				gov_retries = cs.retries,
+				"PHASE crc_heads_paced"
+			);
 			Ok::<(), ChainError>(())
 		}
 	};
@@ -398,9 +407,24 @@ pub async fn run(
 	let (_, results): ((), Vec<Result<CompletedPart, ChainError>>) =
 		futures::try_join!(crc_producer, async { Ok::<_, ChainError>(build.await) })?;
 
+	let build_ms = t_build.elapsed().as_millis();
+	let s = rl.stats();
+	let calls_per_sec = if build_ms > 0 {
+		(s.acquires as f64) / (build_ms as f64 / 1000.0)
+	} else {
+		0.0
+	};
 	tracing::info!(
-		ms = t_build.elapsed().as_millis(),
+		ms = build_ms,
 		segments = n_segments,
+		gov_rate = s.rate,
+		gov_min_rate = s.min_rate,
+		gov_acquires = s.acquires,
+		gov_throttles = s.throttles,
+		gov_down_steps = s.down_steps,
+		gov_up_steps = s.up_steps,
+		gov_retries = s.retries,
+		achieved_calls_per_sec = calls_per_sec,
 		"PHASE build_and_stitch"
 	);
 
