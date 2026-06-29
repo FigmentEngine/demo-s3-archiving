@@ -309,10 +309,12 @@ Resources:
   # Rust / figment-engine-chain  (copy-only segment-chain — SPEED entry, ignores cost ranking)
   # Every image body reaches the archive by server-side UploadPartCopy (bar one
   # 5 MiB bootstrap read), so it escapes the ENI bandwidth floor and is bound by
-  # S3 control-plane call rate. Memory here is a vCPU dial, not a RAM need: start
-  # HIGH (1024 MB) so vCPU never limits the issue rate while finding the 503 knee,
-  # then lower in a second sweep. (Carries no body buffers — RAM use is trivial.)
-  # Needs the ChainIntermediates IAM statement (copy-from + delete on archives/*).
+  # S3 control-plane call rate. An adaptive AIMD rate governor keeps the call
+  # rate under the S3 503 knee under concurrent contention. Memory here is a vCPU
+  # dial, not a RAM need (no body buffers — RAM use is ~70 MB); 1024 MB keeps vCPU
+  # off the critical path. Needs the ChainIntermediates IAM statement (GetObject
+  # copy-source + MPU writes on seg-temps/*); intermediates are reaped by the
+  # seg-temps/ lifecycle rule, so no DeleteObject is required.
   RustFigmentEngineChainFunction:
     Type: AWS::Serverless::Function
     Properties:
