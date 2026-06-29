@@ -41,20 +41,23 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-/// Starting / recovery-ceiling rate. Near the solo sustainable rate so a lone
-/// invocation runs effectively ungoverned.
-const START_RATE: f64 = 3_000.0;
-const CEIL_RATE: f64 = 3_500.0;
+/// Starting rate — deliberately LOW (slow-start, like TCP). Three concurrent
+/// instances each beginning here sum to ~3×START, which must stay under the knee
+/// on the opening wave, before any 503 feedback exists. Recovery ramps it up.
+const START_RATE: f64 = 600.0;
+const CEIL_RATE: f64 = 3_200.0;
 /// Floor: never throttle below this even under heavy contention, or progress
 /// stalls. Several concurrent instances at this floor still sum to a modest rate.
-const FLOOR_RATE: f64 = 200.0;
+const FLOOR_RATE: f64 = 150.0;
 /// Multiplicative decrease on a throttle signal.
 const BACKOFF: f64 = 0.5;
 /// Additive recovery, applied once per RECOVER_INTERVAL of unthrottled running.
-const RECOVER_PER_STEP: f64 = 150.0;
-const RECOVER_INTERVAL: Duration = Duration::from_millis(500);
-/// Token bucket burst ceiling (tokens). Small — we want a smooth rate, not bursts.
-const MAX_BURST: f64 = 64.0;
+const RECOVER_PER_STEP: f64 = 200.0;
+const RECOVER_INTERVAL: Duration = Duration::from_millis(400);
+/// Token bucket burst ceiling (tokens). TINY — a large burst lets concurrent
+/// instances dump a synchronised spike at cold-start before pacing engages, which
+/// is exactly the failure mode. Keep it to a couple of tokens of smoothing only.
+const MAX_BURST: f64 = 4.0;
 
 /// Call class for two-tier priority.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -203,6 +206,19 @@ impl RateLimiter {
 		// Drain the bucket so the backoff takes effect immediately rather than
 		// letting an accumulated burst keep firing at the old rate.
 		self.inner.tokens_milli.store(0, Ordering::Relaxed);
+	}
+
+	/// Acquire for the CRC producer. Identical mechanism to `acquire(High)` — the
+	/// producer competes for the same token stream as the build calls, so when a
+	/// 503 makes the governor back off, the producer slows in lockstep with the
+	/// consumer. That keeps ready-but-unstarted CRCs from stockpiling during a
+	/// backoff and then clumping into a burst when it lifts. Paced from the start
+	/// (no cold-start spike), this is the proactive shaper; `on_throttle` is the
+	/// reactive trim on top.
+	pub async fn acquire_producer(&self) {
+		// Producer is High priority: feeding CRCs unblocks segments, so starving
+		// it would stall the whole build.
+		self.acquire(Priority::High).await;
 	}
 
 	/// Current rate, for logging.

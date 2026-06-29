@@ -30,6 +30,76 @@ use crate::rate_limit::{Priority, RateLimiter};
 
 use crate::plan_chain::{ChainPlan, Entry, Link, Piece, Segment};
 
+/// Shared, awaitable CRC store. The paced HEAD stream fills it as CRCs arrive;
+/// each segment awaits only the CRCs *it* needs (its own entries + the trailing
+/// next-big lookahead) before building, rather than the whole set. Because the
+/// HEADs are paced and issued in plan order, CRCs become available staggered, so
+/// segments start staggered too — no synchronised create burst. The CD at the
+/// end reads the full store (every CRC present by then).
+#[derive(Clone)]
+struct CrcStore {
+	inner: Arc<CrcInner>,
+}
+struct CrcInner {
+	map: std::sync::Mutex<std::collections::HashMap<FileId, u32>>,
+	notify: tokio::sync::Notify,
+}
+impl CrcStore {
+	fn new() -> Self {
+		CrcStore {
+			inner: Arc::new(CrcInner {
+				map: std::sync::Mutex::new(std::collections::HashMap::new()),
+				notify: tokio::sync::Notify::new(),
+			}),
+		}
+	}
+	/// Record a CRC and wake any segments waiting on it.
+	fn put(&self, id: FileId, crc: u32) {
+		self.inner.map.lock().unwrap().insert(id, crc);
+		self.inner.notify.notify_waiters();
+	}
+	fn get(&self, id: FileId) -> Option<u32> {
+		self.inner.map.lock().unwrap().get(&id).copied()
+	}
+	/// Await until every id in `ids` has a CRC present. Re-checks on each wake;
+	/// subscribing to the notify *before* the check avoids missing a wake.
+	async fn wait_for(&self, ids: &[FileId]) {
+		loop {
+			let notified = self.inner.notify.notified();
+			if ids.iter().all(|id| self.get(*id).is_some()) {
+				return;
+			}
+			notified.await;
+		}
+	}
+}
+
+/// The CRC ids a segment needs before it can build: every entry in its links,
+/// plus the trailing-header lookahead (the next segment's big, whose header rides
+/// this segment's tail). Derived from the plan's link pieces.
+fn segment_crc_ids(seg: &Segment) -> Vec<FileId> {
+	let mut ids = Vec::new();
+	for link in &seg.links {
+		match link {
+			Link::Bootstrap { anchor, .. } | Link::AnchorOnly { anchor } => ids.push(*anchor),
+			Link::AnchorThenAppend { anchor, piece } => {
+				ids.push(*anchor);
+				ids.push(piece_id(piece));
+			}
+			Link::ForwardThenAppend { piece } => ids.push(piece_id(piece)),
+		}
+	}
+	ids.sort_by_key(|id| id.0);
+	ids.dedup_by_key(|id| id.0);
+	ids
+}
+
+fn piece_id(p: &Piece) -> FileId {
+	match p {
+		Piece::Header(id) | Piece::Body(id) => *id,
+	}
+}
+
 /// Segment objects are independent — build them wide. Links *within* a segment
 /// are serial (each copies the previous link's completed object), so this bounds
 /// how many segments are in flight at once, not total calls. Solo runs show zero
@@ -37,8 +107,12 @@ use crate::plan_chain::{ChainPlan, Entry, Link, Piece, Segment};
 /// the bottleneck is under-concurrency, not throttling — push this high and let
 /// the rate limiter (added later) cap it for the contended benchmark.
 const SEGMENT_CONCURRENCY: usize = 256;
-/// HEADs for CRC — read-only, cheap, run wide (separate ~5,500/s GET/HEAD budget).
-const CRC_CONCURRENCY: usize = 256;
+/// HEADs for CRC — read-only, cheap. Now issued as a paced background stream that
+/// overlaps building (segments await only their own CRCs). The governor paces the
+/// issue rate; this bounds in-flight HEADs so the stream can't outrun the build's
+/// CRC-consume rate and stockpile a backlog that would let segments clump. ~32
+/// in flight ≈ a few hundred HEADs/s per instance — safe ×3 under the HEAD knee.
+const CRC_CONCURRENCY: usize = 32;
 /// Max attempts per call before giving up. The adaptive governor keeps most
 /// 503s from happening at all; this wider budget rides out the few that slip
 /// through during a backoff transient under concurrent contention.
@@ -163,7 +237,7 @@ pub async fn run(
 	bucket: &str,
 	files_prefix: &str,
 	archive_key: &str,
-	mut plan: ChainPlan,
+	plan: ChainPlan,
 ) -> Result<(), ChainError> {
 	let st = plan.stats;
 	tracing::info!(
@@ -176,22 +250,72 @@ pub async fn run(
 		"PHASE plan"
 	);
 
-	// The adaptive rate governor, created before the first S3 calls so the CRC
-	// HEAD burst is governed too. Solo, it stays near START_RATE and never
-	// throttles (no 503s fire); with concurrent sibling invocations it backs off
-	// on observed SlowDowns so the instances converge under the shared knee.
+	// The adaptive rate governor. Slow-starts low and ramps; backs off on 503s so
+	// concurrent instances converge under the shared knee. With paced HEADs and
+	// CRC-gated (staggered) segment starts there is no cold-start spike for it to
+	// catch — it only trims the sustained residual under contention.
 	let rl = RateLimiter::new();
 
-	// ---- Phase 1: CRCs. Every body is copied, so every entry needs a HEAD. ----
-	let t_crc = Instant::now();
-	fill_crcs(s3, bucket, files_prefix, &mut plan, &rl).await?;
-	tracing::info!(
-		ms = t_crc.elapsed().as_millis(),
-		entries = plan.order.len(),
-		"PHASE crc_heads"
-	);
-
 	let plan = Arc::new(plan);
+	let crcs = CrcStore::new();
+
+	// ---- Paced CRC HEAD stream (overlaps building). ----
+	// Instead of a barrier that HEADs all entries before building starts, the
+	// HEADs run as a paced background stream in plan order, filling the store as
+	// each lands. Each segment awaits only its own CRCs, so segments start
+	// staggered as their CRCs arrive — no synchronised create burst, and no
+	// front-loaded HEAD burst. The producer is governed (High priority) so its
+	// rate tracks the build's and backs off with it under contention.
+	let crc_producer = {
+		let s3 = s3.clone();
+		let bucket = bucket.to_string();
+		let files_prefix = files_prefix.to_string();
+		let plan = plan.clone();
+		let crcs = crcs.clone();
+		let rl = rl.clone();
+		async move {
+			let t_crc = Instant::now();
+			// Issue in plan order so CRCs arrive in roughly the order segments
+			// consume them. CRC_CONCURRENCY bounds the in-flight HEADs; the
+			// governor paces the issue rate.
+			let stream = futures::stream::iter(plan.order.iter().map(|id| {
+				let s3 = s3.clone();
+				let bucket = bucket.clone();
+				let files_prefix = files_prefix.clone();
+				let crcs = crcs.clone();
+				let rl = rl.clone();
+				let name = plan.entries[id].name.clone();
+				let id = *id;
+				async move {
+					let key = format!("{files_prefix}/{name}");
+					let crc_b64 = with_retry_governed(&rl, Priority::High, || async {
+						let out = s3
+							.head_object()
+							.bucket(&bucket)
+							.key(&key)
+							.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+							.send()
+							.await?;
+						Ok::<_, ChainError>(out.checksum_crc32().map(ToOwned::to_owned))
+					})
+					.await?;
+					let crc = crc_b64
+						.as_deref()
+						.and_then(decode_s3_crc32)
+						.ok_or_else(|| ChainError::BadCrc(format!("{id:?}")))?;
+					crcs.put(id, crc);
+					Ok::<(), ChainError>(())
+				}
+			}))
+			.buffer_unordered(CRC_CONCURRENCY);
+			let res: Vec<Result<(), ChainError>> = stream.collect().await;
+			for r in res {
+				r?;
+			}
+			tracing::info!(ms = t_crc.elapsed().as_millis(), "PHASE crc_heads_paced");
+			Ok::<(), ChainError>(())
+		}
+	};
 
 	// ---- Open the final stitch MPU up front. ----
 	// Stitch part numbers are POSITIONAL and known from the plan before any
@@ -200,15 +324,91 @@ pub async fn run(
 	// fire the instant that segment's object is complete — no end-of-run barrier.
 	let stitch_upload_id = create_mpu(s3, bucket, archive_key).await?;
 	let n_segments = plan.segments.len();
-
-	// ---- Build the central directory eagerly. ----
-	// Inputs are ready: offsets at plan time, CRCs after fill_crcs. In the
-	// copy-only design there is no body IO to contend with, so nothing forces the
-	// CD to wait for the stitch (that deferral was a streaming-design habit).
-	// Build it now and upload it as the exempt last part immediately.
-	let t_cd = Instant::now();
-	let cd_bytes = build_central_directory(&plan)?;
 	let cd_part_number = (n_segments + 1) as i32;
+
+	// ---- Build each segment object AND fire its stitch copy, completion-driven. ----
+	// Each segment task first AWAITS its own CRCs (own entries + next-big
+	// lookahead) from the store, so it can't start until they've arrived — which,
+	// because the HEAD stream is paced and in-order, staggers segment starts and
+	// removes the synchronised create burst. It then assembles the segment object
+	// via its serial link chain and immediately UploadPartCopies it into the
+	// stitch MPU as its positional part. The CRC producer runs concurrently (see
+	// the join below), feeding the store as the build consumes it.
+	let t_build = Instant::now();
+	let build = async {
+		let results: Vec<Result<CompletedPart, ChainError>> =
+			futures::stream::iter(plan.segments.iter().map(|seg| {
+				let s3 = s3.clone();
+				let plan = plan.clone();
+				let bucket = bucket.to_string();
+				let files_prefix = files_prefix.to_string();
+				let archive_key = archive_key.to_string();
+				let upload_id = stitch_upload_id.clone();
+				let seg_key = segment_key(&archive_key, seg.index);
+				let stitch_part = (seg.index + 1) as i32;
+				let rl = rl.clone();
+				let crcs = crcs.clone();
+				let crc_ids = segment_crc_ids(seg);
+				async move {
+					// 0) Gate on this segment's CRCs arriving. Because the HEAD stream
+					//    is paced and in plan order, this staggers segment starts and
+					//    removes the synchronised create burst.
+					crcs.wait_for(&crc_ids).await;
+					// 1) Assemble the segment object (serial link chain). Link calls
+					//    are High priority — the critical path.
+					build_segment_object(
+						&s3,
+						&bucket,
+						&files_prefix,
+						&plan,
+						seg,
+						&seg_key,
+						&rl,
+						&crcs,
+					)
+					.await?;
+					// 2) Immediately copy it into the stitch MPU as its positional
+					//    part. Low priority: the stitch copy must yield to segment
+					//    links still being built, which it ultimately depends on.
+					let src = format!("{bucket}/{seg_key}");
+					let part = with_retry_governed(&rl, Priority::Low, || async {
+						upload_part_copy(
+							&s3,
+							&bucket,
+							&archive_key,
+							&upload_id,
+							stitch_part,
+							&src,
+							None,
+						)
+						.await
+					})
+					.await?;
+					Ok::<_, ChainError>(part)
+				}
+			}))
+			.buffer_unordered(SEGMENT_CONCURRENCY)
+			.collect()
+			.await;
+		results
+	};
+
+	// Run the paced CRC producer and the build concurrently. The producer feeds
+	// the store as the build consumes it; both must succeed.
+	let (_, results): ((), Vec<Result<CompletedPart, ChainError>>) =
+		futures::try_join!(crc_producer, async { Ok::<_, ChainError>(build.await) })?;
+
+	tracing::info!(
+		ms = t_build.elapsed().as_millis(),
+		segments = n_segments,
+		"PHASE build_and_stitch"
+	);
+
+	// ---- Central directory, built now that every CRC is in the store. ----
+	// It needs all CRCs, so it can only be built once the producer has finished —
+	// which it has (try_join above). Uploaded as the stitch MPU's exempt last part.
+	let t_cd = Instant::now();
+	let cd_bytes = build_central_directory(&plan, &crcs)?;
 	let cd_part = {
 		let s3 = s3.clone();
 		let bucket = bucket.to_string();
@@ -234,66 +434,13 @@ pub async fn run(
 		})
 		.await?
 	};
-	tracing::info!(ms = t_cd.elapsed().as_millis(), "PHASE cd_eager");
-
-	// ---- Build each segment object AND fire its stitch copy, completion-driven. ----
-	// Each segment task: build the segment object via its link chain, then
-	// immediately UploadPartCopy it as stitch part (index+1). The stitch copies
-	// thus overlap segment-building entirely — each fires the moment its own
-	// segment finishes, riding the same pool, rather than waiting for all
-	// segments. (SPEED: a future two-tier rate limiter would prioritise segment
-	// links over stitch copies under one global cap; here they share the pool.)
-	let t_build = Instant::now();
-	let results: Vec<Result<CompletedPart, ChainError>> =
-		futures::stream::iter(plan.segments.iter().map(|seg| {
-			let s3 = s3.clone();
-			let plan = plan.clone();
-			let bucket = bucket.to_string();
-			let files_prefix = files_prefix.to_string();
-			let archive_key = archive_key.to_string();
-			let upload_id = stitch_upload_id.clone();
-			let seg_key = segment_key(&archive_key, seg.index);
-			let stitch_part = (seg.index + 1) as i32;
-			let rl = rl.clone();
-			async move {
-				// 1) Assemble the segment object (serial link chain). Link calls
-				//    are High priority — the critical path.
-				build_segment_object(&s3, &bucket, &files_prefix, &plan, seg, &seg_key, &rl)
-					.await?;
-				// 2) Immediately copy it into the stitch MPU as its positional
-				//    part. Low priority: the stitch copy must yield to segment
-				//    links still being built, which it ultimately depends on.
-				let src = format!("{bucket}/{seg_key}");
-				let part = with_retry_governed(&rl, Priority::Low, || async {
-					upload_part_copy(
-						&s3,
-						&bucket,
-						&archive_key,
-						&upload_id,
-						stitch_part,
-						&src,
-						None,
-					)
-					.await
-				})
-				.await?;
-				Ok::<_, ChainError>(part)
-			}
-		}))
-		.buffer_unordered(SEGMENT_CONCURRENCY)
-		.collect()
-		.await;
+	tracing::info!(ms = t_cd.elapsed().as_millis(), "PHASE cd");
 
 	let mut parts: Vec<CompletedPart> = Vec::with_capacity(n_segments + 1);
 	parts.push(cd_part);
 	for r in results {
 		parts.push(r?);
 	}
-	tracing::info!(
-		ms = t_build.elapsed().as_millis(),
-		segments = n_segments,
-		"PHASE build_and_stitch"
-	);
 
 	// ---- The one irreducible tail: complete the stitch MPU. ----
 	let t_done = Instant::now();
@@ -331,6 +478,7 @@ async fn build_segment_object(
 	seg: &Segment,
 	seg_key: &str,
 	rl: &RateLimiter,
+	crcs: &CrcStore,
 ) -> Result<(), ChainError> {
 	// The object built by the PREVIOUS link in this chain (copy-forward source).
 	// For all but the first link it is `seg_key` itself (each link overwrites it).
@@ -359,6 +507,7 @@ async fn build_segment_object(
 				link,
 				prev_object.as_deref(),
 				&out_key,
+				crcs,
 			)
 			.await
 		})
@@ -386,6 +535,7 @@ async fn build_one_link(
 	link: &Link,
 	prev_object: Option<&str>,
 	out_key: &str,
+	crcs: &CrcStore,
 ) -> Result<(), ChainError> {
 	let upload_id = create_mpu(s3, bucket, out_key).await?;
 	let mut parts: Vec<CompletedPart> = Vec::with_capacity(2);
@@ -394,7 +544,7 @@ async fn build_one_link(
 		Link::Bootstrap { anchor, steal_len } => {
 			// part1 = UploadPart( LFH_big0 ++ GET big0[..steal_len] )  (== 5 MiB)
 			let entry = &plan.entries[anchor];
-			let header = zip_format::local_header(&meta_of(entry)?);
+			let header = zip_format::local_header(&meta_of(entry, crcs)?);
 			let prefix = get_object_range_bytes(
 				s3,
 				bucket,
@@ -437,6 +587,7 @@ async fn build_one_link(
 					out_key,
 					&upload_id,
 					2,
+					crcs,
 				)
 				.await?,
 			);
@@ -458,6 +609,7 @@ async fn build_one_link(
 					out_key,
 					&upload_id,
 					2,
+					crcs,
 				)
 				.await?,
 			);
@@ -478,11 +630,12 @@ async fn build_piece_part(
 	out_key: &str,
 	upload_id: &str,
 	part_number: i32,
+	crcs: &CrcStore,
 ) -> Result<CompletedPart, ChainError> {
 	match piece {
 		Piece::Header(id) => {
 			let entry = &plan.entries[id];
-			let bytes = zip_format::local_header(&meta_of(entry)?);
+			let bytes = zip_format::local_header(&meta_of(entry, crcs)?);
 			upload_part(s3, bucket, out_key, upload_id, part_number, bytes).await
 		}
 		Piece::Body(id) => {
@@ -494,12 +647,12 @@ async fn build_piece_part(
 }
 
 /// Central directory + ZIP64 end records from the realised plan (all CRCs known).
-fn build_central_directory(plan: &ChainPlan) -> Result<Vec<u8>, ChainError> {
+fn build_central_directory(plan: &ChainPlan, crcs: &CrcStore) -> Result<Vec<u8>, ChainError> {
 	let mut out = Vec::new();
 	let mut cd_size = 0u64;
 	for id in &plan.order {
 		let e = &plan.entries[id];
-		let rec = zip_format::central_dir_entry(&meta_of(e)?);
+		let rec = zip_format::central_dir_entry(&meta_of(e, crcs)?);
 		cd_size += rec.len() as u64;
 		out.extend_from_slice(&rec);
 	}
@@ -511,8 +664,10 @@ fn build_central_directory(plan: &ChainPlan) -> Result<Vec<u8>, ChainError> {
 	Ok(out)
 }
 
-fn meta_of(e: &Entry) -> Result<EntryMeta, ChainError> {
-	let crc = e.crc.ok_or_else(|| ChainError::BadCrc(e.name.clone()))?;
+fn meta_of(e: &Entry, crcs: &CrcStore) -> Result<EntryMeta, ChainError> {
+	let crc = crcs
+		.get(e.id)
+		.ok_or_else(|| ChainError::BadCrc(e.name.clone()))?;
 	Ok(EntryMeta {
 		name: e.name.clone(),
 		size: e.size,
@@ -644,59 +799,4 @@ async fn get_object_range_bytes(
 		data.extend_from_slice(&chunk?);
 	}
 	Ok(data)
-}
-
-/// HEAD every entry for its stored CRC32 (all objects carry one).
-async fn fill_crcs(
-	s3: &Client,
-	bucket: &str,
-	files_prefix: &str,
-	plan: &mut ChainPlan,
-	rl: &RateLimiter,
-) -> Result<(), ChainError> {
-	let jobs: Vec<(FileId, String)> = plan
-		.order
-		.iter()
-		.map(|id| {
-			let name = plan.entries[id].name.clone();
-			(*id, format!("{files_prefix}/{name}"))
-		})
-		.collect();
-
-	let results: Vec<Result<(FileId, Option<String>), ChainError>> =
-		futures::stream::iter(jobs.into_iter().map(|(id, key)| {
-			let s3 = s3.clone();
-			let bucket = bucket.to_string();
-			let rl = rl.clone();
-			async move {
-				// HEADs are the front-loaded ~3000-call burst; govern them so a
-				// contended start doesn't trip the bucket before building begins.
-				with_retry_governed(&rl, Priority::High, || async {
-					let out = s3
-						.head_object()
-						.bucket(&bucket)
-						.key(&key)
-						.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
-						.send()
-						.await?;
-					Ok::<_, ChainError>((id, out.checksum_crc32().map(ToOwned::to_owned)))
-				})
-				.await
-			}
-		}))
-		.buffer_unordered(CRC_CONCURRENCY)
-		.collect()
-		.await;
-
-	for res in results {
-		let (id, crc_b64) = res?;
-		let crc = crc_b64
-			.as_deref()
-			.and_then(decode_s3_crc32)
-			.ok_or_else(|| ChainError::BadCrc(format!("{id:?}")))?;
-		if let Some(e) = plan.entries.get_mut(&id) {
-			e.crc = Some(crc);
-		}
-	}
-	Ok(())
 }
