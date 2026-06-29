@@ -26,6 +26,8 @@ use figment_engine::engine::crc::decode_s3_crc32;
 use figment_engine::engine::plan::FileId;
 use figment_engine::engine::zip_format::{self, EntryMeta};
 
+use crate::rate_limit::{Priority, RateLimiter};
+
 use crate::plan_chain::{ChainPlan, Entry, Link, Piece, Segment};
 
 /// Segment objects are independent — build them wide. Links *within* a segment
@@ -37,8 +39,10 @@ use crate::plan_chain::{ChainPlan, Entry, Link, Piece, Segment};
 const SEGMENT_CONCURRENCY: usize = 256;
 /// HEADs for CRC — read-only, cheap, run wide (separate ~5,500/s GET/HEAD budget).
 const CRC_CONCURRENCY: usize = 256;
-/// Max attempts per call before giving up (transient breaks + SlowDown/5xx).
-const MAX_ATTEMPTS: u32 = 5;
+/// Max attempts per call before giving up. The adaptive governor keeps most
+/// 503s from happening at all; this wider budget rides out the few that slip
+/// through during a backoff transient under concurrent contention.
+const MAX_ATTEMPTS: u32 = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChainError {
@@ -108,6 +112,51 @@ where
 	}
 }
 
+/// Like `with_retry`, but routes every attempt through the adaptive rate
+/// governor: acquire a token (at the given priority) before issuing, and on a
+/// throttle signal tell the governor to back off so concurrent instances
+/// converge under the shared S3 knee. The governor keeps most 503s from ever
+/// happening; the wider retry budget here rides out the few that still slip
+/// through during a backoff transient.
+async fn with_retry_governed<T, F, Fut>(
+	rl: &RateLimiter,
+	prio: Priority,
+	mut op: F,
+) -> Result<T, ChainError>
+where
+	F: FnMut() -> Fut,
+	Fut: std::future::Future<Output = Result<T, ChainError>>,
+{
+	let mut attempt: u32 = 0;
+	loop {
+		rl.acquire(prio).await;
+		match op().await {
+			Ok(v) => return Ok(v),
+			Err(e) => {
+				let retryable = is_retryable(&e);
+				if retryable {
+					// Distinguish a throttle (back off the rate) from a transient
+					// stream break (retry, but don't penalise the rate).
+					let s = e.to_string();
+					if s.contains("SlowDown") || s.contains("Throttl") || s.contains("(503)") {
+						rl.on_throttle();
+					}
+				}
+				attempt += 1;
+				if attempt >= MAX_ATTEMPTS || !retryable {
+					return Err(e);
+				}
+				let base_ms = 100u64.saturating_mul(1u64 << (attempt - 1).min(7));
+				let jitter_ms = std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map(|d| d.subsec_micros() as u64)
+					.unwrap_or(0) % 100;
+				tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+			}
+		}
+	}
+}
+
 /// Entry point: realise `plan` into the archive at `archive_key`.
 pub async fn run(
 	s3: &Client,
@@ -127,9 +176,15 @@ pub async fn run(
 		"PHASE plan"
 	);
 
+	// The adaptive rate governor, created before the first S3 calls so the CRC
+	// HEAD burst is governed too. Solo, it stays near START_RATE and never
+	// throttles (no 503s fire); with concurrent sibling invocations it backs off
+	// on observed SlowDowns so the instances converge under the shared knee.
+	let rl = RateLimiter::new();
+
 	// ---- Phase 1: CRCs. Every body is copied, so every entry needs a HEAD. ----
 	let t_crc = Instant::now();
-	fill_crcs(s3, bucket, files_prefix, &mut plan).await?;
+	fill_crcs(s3, bucket, files_prefix, &mut plan, &rl).await?;
 	tracing::info!(
 		ms = t_crc.elapsed().as_millis(),
 		entries = plan.order.len(),
@@ -199,12 +254,17 @@ pub async fn run(
 			let upload_id = stitch_upload_id.clone();
 			let seg_key = segment_key(&archive_key, seg.index);
 			let stitch_part = (seg.index + 1) as i32;
+			let rl = rl.clone();
 			async move {
-				// 1) Assemble the segment object (serial link chain).
-				build_segment_object(&s3, &bucket, &files_prefix, &plan, seg, &seg_key).await?;
-				// 2) Immediately copy it into the stitch MPU as its positional part.
+				// 1) Assemble the segment object (serial link chain). Link calls
+				//    are High priority — the critical path.
+				build_segment_object(&s3, &bucket, &files_prefix, &plan, seg, &seg_key, &rl)
+					.await?;
+				// 2) Immediately copy it into the stitch MPU as its positional
+				//    part. Low priority: the stitch copy must yield to segment
+				//    links still being built, which it ultimately depends on.
 				let src = format!("{bucket}/{seg_key}");
-				let part = with_retry(|| async {
+				let part = with_retry_governed(&rl, Priority::Low, || async {
 					upload_part_copy(
 						&s3,
 						&bucket,
@@ -270,6 +330,7 @@ async fn build_segment_object(
 	plan: &ChainPlan,
 	seg: &Segment,
 	seg_key: &str,
+	rl: &RateLimiter,
 ) -> Result<(), ChainError> {
 	// The object built by the PREVIOUS link in this chain (copy-forward source).
 	// For all but the first link it is `seg_key` itself (each link overwrites it).
@@ -286,7 +347,10 @@ async fn build_segment_object(
 			format!("{seg_key}.l{li}")
 		};
 
-		with_retry(|| async {
+		// Each link is governed at High priority (the critical path). The
+		// governor paces at link granularity; AIMD adapts the link-rate to
+		// whatever keeps SlowDowns away regardless of the calls-per-link factor.
+		with_retry_governed(rl, Priority::High, || async {
 			build_one_link(
 				s3,
 				bucket,
@@ -303,9 +367,9 @@ async fn build_segment_object(
 		// NOTE: the previous link's temp object is NOT deleted here. The inline
 		// delete used to sit on the critical path — one full round-trip per link,
 		// ~4,500 serial deletes across the run, all pure housekeeping the next
-		// link doesn't depend on. All `.l{li}` temps are reaped together in the
-		// deferred `cleanup` after the archive completes, so they never compete
-		// for the serial chain's round-trip budget.
+		// link doesn't depend on. All `.l{li}` temps are reaped together by the
+		// S3 lifecycle rule on the seg-temps/ prefix, so they never compete for
+		// the serial chain's round-trip budget.
 		if !is_last_link {
 			prev_object = Some(out_key);
 		}
@@ -588,6 +652,7 @@ async fn fill_crcs(
 	bucket: &str,
 	files_prefix: &str,
 	plan: &mut ChainPlan,
+	rl: &RateLimiter,
 ) -> Result<(), ChainError> {
 	let jobs: Vec<(FileId, String)> = plan
 		.order
@@ -602,8 +667,11 @@ async fn fill_crcs(
 		futures::stream::iter(jobs.into_iter().map(|(id, key)| {
 			let s3 = s3.clone();
 			let bucket = bucket.to_string();
+			let rl = rl.clone();
 			async move {
-				with_retry(|| async {
+				// HEADs are the front-loaded ~3000-call burst; govern them so a
+				// contended start doesn't trip the bucket before building begins.
+				with_retry_governed(&rl, Priority::High, || async {
 					let out = s3
 						.head_object()
 						.bucket(&bucket)
