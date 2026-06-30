@@ -1,5 +1,5 @@
 {
-  "Comment": "Benchmark the contender Lambdas: for each ARN run the lambda RunsPerContender times (timed, bounded concurrency), validate run-0's archive with the control Lambda, aggregate mean/stddev/min/max, apply a performance gate (mean+stddev < MaxRunTimeMs), then delete all archives. Outputs ordered success / failure lists. Both contenders and their repeat-runs execute sequentially (MaxConcurrency 1) so each invocation faces the bucket alone.",
+  "Comment": "Benchmark the contender Lambdas: for each ARN run the lambda RunsPerContender times in parallel (timed), validate run-0's archive with the control Lambda, aggregate mean/stddev/min/max, apply a performance gate (mean+stddev < MaxRunTimeMs), then delete all archives. Outputs ordered success / failure lists.",
   "QueryLanguage": "JSONata",
   "StartAt": "BenchOverContenders",
   "States": {
@@ -9,7 +9,7 @@
       "ItemSelector": {
         "arn": "{% $states.context.Map.Item.Value %}"
       },
-      "MaxConcurrency": 1,
+      "MaxConcurrency": 0,
       "ItemProcessor": {
         "ProcessorConfig": {
           "Mode": "INLINE"
@@ -58,15 +58,14 @@
           },
           "RunContenderTimes": {
             "Type": "Map",
-            "Comment": "Run the contender RunsPerContender times SEQUENTIALLY (MaxConcurrency 1). Each invocation faces the bucket alone — the condition every contender is designed for. Concurrent repeat-runs were found to push call-heavy designs past the S3 SlowDown knee: one design issuing ~22k calls run 3-wide against an already-hot shared bucket saturates it at any achievable rate (thousands of 503s even when self-throttled to the floor). Sequential repeats measure true single-invocation cost without self-inflicted contention. Each run writes its own archive key (archive_key_base-<runIndex>.zip).",
+            "Comment": "Run the contender RunsPerContender times in parallel. Each run writes to its own archive key (archive_key_base-<runIndex>.zip).",
             "Items": "{% $run_indices %}",
             "ItemSelector": {
               "run_index": "{% $states.context.Map.Item.Value %}",
               "arn": "{% $arn %}",
-              "archive_key": "{% $archive_key_base & '-' & $string($states.context.Map.Item.Value) & '.zip' %}",
-              "archive_key_base": "{% $archive_key_base %}"
+              "archive_key": "{% $archive_key_base & '-' & $string($states.context.Map.Item.Value) & '.zip' %}"
             },
-            "MaxConcurrency": 1,
+            "MaxConcurrency": 0,
             "ItemProcessor": {
               "ProcessorConfig": {
                 "Mode": "INLINE"
@@ -146,8 +145,8 @@
               "contender_failed": "{% $boolean($states.input[kind='run_failure']) ? true : false %}",
               "failure_reason": "{% ($res := $states.input[kind='run_failure'][0].reason ; $boolean($res) ? $res : null) %}",
               "durations": "{% ($res := $states.input[kind='run_success'].duration_ms ; $boolean($res) ? [$res] : [] ) %}",
-              "archive_key_run0": "{% $archive_key_base & '-0.zip' %}",
-              "all_archive_keys": "{% $states.input.archive_key %}"
+              "archive_key_run0": "{% [$states.input.archive_key][0] %}",
+              "all_archive_keys": "{% [$states.input.archive_key] %}"
             },
             "Next": "CheckRunsSucceeded"
           },
