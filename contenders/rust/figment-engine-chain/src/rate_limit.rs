@@ -50,12 +50,14 @@ const KNEE: f64 = 3_500.0;
 /// Only used to pick the START rate at fair share; the AIAD then adapts to the
 /// actual observed capacity regardless of whether this guess is exact.
 const ASSUMED_INSTANCES: f64 = 3.0;
-/// Start at fair share ≈ 1,170/s. 3×START ≈ KNEE → right at the shared limit from
-/// the first call; solo, recovery lifts it toward CEIL.
-const START_RATE: f64 = KNEE / ASSUMED_INSTANCES;
-/// Recovery ceiling = the chain's natural solo issue rate. No point issuing
-/// faster than the build consumes; this also stops a solo run from running away.
-const CEIL_RATE: f64 = 1_830.0;
+// Start rate: begin near solo's natural rate so there's little ramp tax.
+//    Under sequential repeats each invocation is alone, so a high start is safe;
+//    the additive down-step still handles any incidental 503.
+const START_RATE: f64 = 1_800.0; // was KNEE / ASSUMED_INSTANCES (≈1170)
+								 // Ceiling: was capping solo at 1830; raise so the governor isn't a solo brake.
+								 //    Chain is latency-bound at ~1316/s solo so it won't actually hit this — the
+								 //    point is to stop the ceiling acting as a throttle on a run that never 503s.
+const CEIL_RATE: f64 = 3_200.0; // was 1_830.0
 /// Safety floor. Additive-decrease-from-fair-share should rarely approach this;
 /// if it does, contention is extreme and we crawl rather than crash.
 const FLOOR_RATE: f64 = 200.0;
@@ -64,8 +66,8 @@ const STEP_DOWN: f64 = 100.0;
 /// At most one down-step per this window — concurrent 503s from one contention
 /// wave collapse to a single step. THIS is what prevents the AIMD-style crash.
 const DOWN_WINDOW: Duration = Duration::from_millis(100);
-/// Additive increase per RECOVER_INTERVAL of clean (no-503) running.
-const STEP_UP: f64 = 50.0;
+// Recovery step: climb back to ceiling faster after any incidental dip.
+const STEP_UP: f64 = 150.0; // was 50.0
 const RECOVER_INTERVAL: Duration = Duration::from_millis(500);
 /// Token bucket burst ceiling (tokens). Tiny — smoothing only, no cold-start dump.
 const MAX_BURST: f64 = 4.0;

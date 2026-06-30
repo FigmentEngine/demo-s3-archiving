@@ -321,7 +321,7 @@ Resources:
       FunctionName: !Sub ${ProjectName}-rust-figment-engine-chain
       CodeUri: ../contenders/rust/figment-engine-chain
       Runtime: provided.al2023
-      MemorySize: 1024
+      MemorySize: 256
       Timeout: 600
       Handler: rust.handler
       Architectures:
