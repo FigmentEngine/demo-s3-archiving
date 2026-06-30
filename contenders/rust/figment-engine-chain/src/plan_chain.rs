@@ -34,7 +34,7 @@ pub struct Entry {
     pub name: String,
     pub size: u64,
     pub local_header_offset: u64,
-    #[allow(dead_code)] // used in tests
+    #[cfg(test)] // used in tests
     pub crc: Option<u32>,
 }
 
@@ -263,7 +263,7 @@ pub fn plan_segment_chain(files: Vec<SourceFile>) -> Result<ChainPlan, PlanError
     let mut entries: HashMap<FileId, Entry> = HashMap::new();
     let mut cd_size: u64 = 0;
     for (i, id) in order.iter().enumerate() {
-        let (name, size) = size_of[id].clone();
+        let (name, size) = size_of.remove(id).expect("every ordered id is in size_of");
         cd_size += zip_format::central_dir_entry_len(&name, offsets[i]);
         entries.insert(
             *id,
@@ -272,6 +272,7 @@ pub fn plan_segment_chain(files: Vec<SourceFile>) -> Result<ChainPlan, PlanError
                 name,
                 size,
                 local_header_offset: offsets[i],
+                #[cfg(test)]
                 crc: None,
             },
         );
