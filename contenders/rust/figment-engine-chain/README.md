@@ -16,14 +16,15 @@ CRC decoding, and S3 plumbing; it adds only its own planner and executor.
 
 | | Duration | Memory | Peak RAM | Bodies over the ENI |
 |---|---|---|---|---|
-| **figment-engine-chain** | **~11 s** | 1792 MB | ~75 MB | **one 5 MiB read, total** |
-| figment-engine (single-MPU) | ~TODO_FE_DURATION | 640 MB | ~460 MB | ~7.5 GB |
-| reference jrodon-v2 | ~106 s | 640 MB | — | ~14.65 GB |
+| **figment-engine-chain** | **~11 s** | 1792 MB | ~98 MB | **one 5 MiB read, total** |
+| figment-engine (single-MPU) | ~111 s | 640 MB | ~460 MB | ~7.5 GB |
+| reference jrodon-v2 | ~105 s | 512 MB | — | ~14.65 GB |
 
 <!--
-  Fill TODO_* from the sequential-harness run (both contenders + reference under
-  ONE harness, directly comparable). Solo placeholders: chain ~15 s,
-  figment-engine ~116 s. State harness conditions when filling.
+  Durations above are from one sequential-repeat harness run (all contenders +
+  reference under the same harness, directly comparable; MaxConcurrency 1 so each
+  invocation faces the bucket alone). run_price_usd that run: chain $0.000268
+  (cheapest), jrodon-v2 $0.000706, figment-engine $0.000928.
 -->
 
 Validated byte-for-byte by the benchmark's control Lambda (re-reads all
@@ -106,6 +107,51 @@ independent and run concurrently. The finished segment objects are then
 copy-stitched into the final archive by one flat MPU (segment *k* → stitch
 part *k+1*), with the central directory as the exempt last part.
 
+#### Worked example: a segment of one big + two smalls
+
+Each link is a complete MPU. Its **part 1** copies the *entire previous link's
+object* forward (always ≥ 5 MiB once the big is in, so it clears the floor as a
+non-last part). Its **last part** appends the next piece — a sub-floor header or
+small — which is legal *because the last part is floor-exempt*. The header of
+the next body rides the **tail** of the part that precedes it, so the Lambda
+never writes a body, only thin header bytes.
+
+```
+ Link 0  (bootstrap; entry 0 only)        object L0 =
+   part1 = [LFH_big] + read(big[..5MiB])    ──► [LFH_big][big 0..5MiB]
+   part2 = copy(big[5MiB..])  (exempt)            …[big 5MiB..end]
+                                            L0 = [LFH_big][   big   ]
+
+ Link 1  append small s1                   object L1 =
+   part1 = copy(L0)            (≥5MiB)      ──► [LFH_big][big]
+   part2 = [LFH_s1] + copy(s1) (exempt)            …[LFH_s1][s1]
+                                            L1 = [LFH_big][big][LFH_s1][s1]
+
+ Link 2  append small s2                   object L2 =
+   part1 = copy(L1)            (≥5MiB)      ──► [LFH_big][big][LFH_s1][s1]
+   part2 = [LFH_s2] + copy(s2) (exempt)            …[LFH_s2][s2]
+                                            L2 = [LFH_big][big][LFH_s1][s1][LFH_s2][s2]
+```
+
+`L2` is the finished segment object: the big and both smalls, each with its
+header, contiguous and in order. Note `part2` mixes Lambda-generated header
+bytes with a copied body — allowed **only** because it is the MPU's last part
+(the one place the 5 MiB floor doesn't apply). A segment of *k* smalls is *k*+1
+links; the benchmark's ~1:1 big:small ratio makes most chains depth 2–3.
+
+The stitch then treats each finished `L`-object as one ≥5 MiB copy part:
+
+```
+ Stitch MPU (one, flat)
+   part1 = copy(segment_0 object)   (≥5MiB, non-last)
+   part2 = copy(segment_1 object)   (≥5MiB, non-last)
+   …
+   partN = copy(segment_{N-1})      (≥5MiB, non-last)
+   last  = [central directory]      (exempt last part)
+   ─────────────────────────────────────────────────
+   = the final flat STORED ZIP64 archive
+```
+
 **Why not one MPU per segment?** Because the format forbids it:
 
 > **A pure-copy archive of more than one entry cannot be a single MPU.** Every
@@ -122,7 +168,7 @@ benchmark's ~1:1 ratio, nearly every chain is depth 2–3 — the shallowest the
 floor permits. The structure is provably call-minimal; the remaining gains are
 all *operational*.
 
-### Why it doesn't throttle — solves 4
+### Why it stays under the throttle in isolation — solves 4
 
 This is the counter-intuitive part, given the `figment-engine` README's caution
 that multi-object fan-out "reliably trips SlowDown". The distinction is **rate,
@@ -133,14 +179,19 @@ not count**:
 - But the links within each segment are **serial** (each waits on the
   previous's completed object), so the achievable *rate* is bounded by chain
   latency, not by how many futures you spawn.
-- In isolation the chain sustains only ~1 500–1 600 calls/s — well under half
-  S3's ~3 500/s per-bucket `SlowDown` knee. **It cannot issue fast enough to
-  trip the throttle**, even at high concurrency.
+- In isolation the chain sustains ~1 300–2 100 calls/s depending on the vCPU
+  tier — at or under S3's ~3 500/s per-bucket `SlowDown` knee. Run alone, **it
+  does not trip the throttle**, even at high concurrency.
 
-So a copy-only design is, paradoxically, *gentle* on the bucket — the opposite
-of the streaming contenders that 503 under contention. The structural
-serialism that bounds its speed is the same thing that bounds its call rate
-safely under the knee.
+So a single copy-only invocation is, paradoxically, *gentle* on the bucket. It
+is not immune, though: several copies of the chain sharing one bucket *do* cross
+the knee together. An adaptive **AIAD** governor (`src/rate_limit.rs`) paces the
+issue rate — additive step-down on a 503, additive recovery when clean, windowed
+so a burst of concurrent 503s counts once — and every individual S3 call passes
+through it, so the governed rate reflects real bucket load. The benchmark runs
+repeats **sequentially** (one invocation at a time), which is the condition every
+contender targets; the governor never has to engage there, but it keeps the
+design safe under incidental contention.
 
 ## What actually bounds the wall-clock
 
@@ -149,19 +200,19 @@ Because no bytes cross the ENI (bar the one bootstrap read), the run is bound by
 throttle. The phase breakdown on the benchmark data:
 
 ```
-PHASE crc_heads        ~1.9 s    HEAD ~3000 objects for stored CRC32 (read-side)
-PHASE cd_eager         ~0.04 s   build + upload the central directory up front
-PHASE build_and_stitch ~12.2 s   the segment chains + overlapped stitch — the floor
-PHASE terminal_complete ~0.5 s   the single CompleteMultipartUpload on 15.7 GB
+PHASE crc_heads_paced  ~3–5 s   paced HEAD producer fills CRC32 store (overlaps build)
+PHASE build_and_stitch ~10.5 s  the segment chains + overlapped stitch — the floor
+PHASE cd               ~0.04 s  build + upload the central directory
+PHASE terminal_complete ~0.5 s  the single CompleteMultipartUpload on 15.7 GB
 ```
 
 `build_and_stitch` is ~all of it, and it's serial-latency-bound: ~22 k calls
 through chains that are ~2–3 links deep, each link a serial
-`create → copy → append → complete`. Confirmed by experiment — raising segment
-concurrency from 256 to 512 did **not** help (it's not concurrency-starved),
-and the AWS SDK's HTTP layer exposes no connection-pool knob that would
-(connections are already effectively unbounded). The floor is the round-trip
-latency of the serial chains, which is structural.
+`create → copy → append → complete`, every call individually governed. Confirmed
+by experiment — raising segment concurrency from 256 to 512 did **not** help
+(it's not concurrency-starved), and the AWS SDK's HTTP layer exposes no
+connection-pool knob that would (connections are already effectively unbounded).
+The floor is the round-trip latency of the serial chains, which is structural.
 
 ### Memory is a vCPU dial, not a RAM need
 
@@ -200,7 +251,9 @@ the control Lambda before the next:
 | Overlapped completion-driven stitch + eager CD | ~32.5 s* | ~36 s | *stitch folded in; not yet the lever |
 | Concurrency 64 → 256 | ~13.9 s | ~17.6 s | The big lever — was under-concurrent |
 | Per-link deletes off the critical path | ~12.3 s | ~15 s | One round-trip removed per link |
-| Cleanup → S3 lifecycle (off the measured path) | ~12.2 s | **~TODO** | Benchmark times the invoke; GC moved out |
+| Cleanup → S3 lifecycle (off the measured path) | ~12.2 s | ~15 s | Benchmark times the invoke; GC moved out |
+| Paced CRC producer + per-call governing | ~16.5 s | ~17 s | Each S3 call governed (not per-link); CRCs streamed, not barriered |
+| Memory 1024 → 1792 MB (vCPU at the floor) | ~10.5 s | **~11 s** | vCPU dial to the latency floor (see sweep) |
 
 Build-correct-first was deliberate: a validated baseline meant every
 optimisation could be checked against "still produces a byte-valid archive",
@@ -222,10 +275,10 @@ Same pure-engine / thin-executor split as `figment-engine`:
                                            ▼
                        ┌──────────────────────────────────────────┐
                        │  assemble_chain  (executor, no logic)    │
-                       │  HEAD all → CRC32                        │
-                       │  build CD eagerly (off critical path)    │
+                       │  paced HEAD producer → CRC32 store        │
                        │  build segments concurrently (256-wide)  │
                        │    each fires its stitch copy on finish   │
+                       │  build CD (needs all CRCs)               │
                        │  one terminal CompleteMultipartUpload    │
                        └──────────────────────────────────────────┘
 ```
@@ -234,12 +287,14 @@ Intermediate segment/link objects live under a dedicated **`seg-temps/`**
 prefix and are reaped by an S3 **lifecycle rule**, not by the Lambda — so
 cleanup never sits inside the benchmark-measured invoke duration.
 
-## Tunables (`src/assemble_chain.rs`)
+## Tunables (`src/assemble_chain.rs`, `src/rate_limit.rs`)
 
 ```rust
 const SEGMENT_CONCURRENCY: usize = 256;  // segments in flight; 512 gave no gain
-const CRC_CONCURRENCY:     usize = 256;  // HEAD fan-out (read-side budget)
-const MAX_ATTEMPTS:        u32   = 5;    // bounded retry on transient/SlowDown
+const CRC_CONCURRENCY:     usize = 128;  // paced HEAD producer fan-out
+const MAX_ATTEMPTS:        u32   = 10;   // bounded retry on transient/SlowDown
+// rate_limit.rs: AIAD governor — START 1800, CEIL 3200, FLOOR 200 calls/s,
+// additive ±step, windowed; every S3 call acquires before issuing.
 ```
 
 ## Design decisions (summary)
@@ -253,8 +308,8 @@ const MAX_ATTEMPTS:        u32   = 5;    // bounded retry on transient/SlowDown
 | Per-segment structure | Chain of *k*+1 MPUs ("links") | Pure-copy >1 entry can't be one MPU (2n−S minimum) |
 | Allocation | One segment per big, spread smalls thin | Maximising S minimises calls *and* chain depth |
 | Stitch | One flat MPU, completion-driven | Each segment's copy fires as it finishes; one Complete at the end |
-| Central directory | Built eagerly after CRCs, uploaded as exempt last part | No body IO to contend with, so nothing needs deferring |
-| Throttle-safety | None needed in isolation | Serial chains self-limit to ~1.6 k calls/s, under the knee |
+| Central directory | Built after all CRCs, uploaded as the stitch's exempt last part | Needs every entry's CRC; no body IO to contend with |
+| Throttle-safety | AIAD governor, per-call | Solo stays under the knee; governor paces real calls under incidental contention |
 | Cleanup | S3 lifecycle rule on `seg-temps/` | Keeps GC out of the benchmark-measured invoke |
 | Memory | 1792 MB / arm64 | No bodies/compute; pure vCPU dial. Lowest tier at the ~10.5 s build floor (see sweep); ~75 MB peak |
 
